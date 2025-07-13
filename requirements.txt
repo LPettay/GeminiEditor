@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+openai-whisper==20231117
+ffmpeg-python==0.2.0
+torch --index-url https://download.pytorch.org/whl/cu128
+torchvision --index-url https://download.pytorch.org/whl/cu128
+torchaudio --index-url https://download.pytorch.org/whl/cu128
+google-generativeai
+pydantic==2.5.2
+python-dotenv 
+moviepy
+thefuzz
+python-Levenshtein
+nltk
