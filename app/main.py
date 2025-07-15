@@ -1,8 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile, Form, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 import os
 import shutil
 import json
@@ -129,8 +129,127 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # This will serve both MP3 previews and JSON peaks files
 app.mount("/previews", StaticFiles(directory=PREVIEW_DIR), name="previews")
 
-# Serve original uploads so UI can preview full video for scrubbing
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# Temporarily comment out static mount to test routing
+# app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# Test endpoint to verify routing
+@app.get("/test-video")
+async def test_video():
+    return {"message": "Video endpoint is working"}
+
+@app.get("/test-video-path/{filename:path}")
+async def test_video_path(filename: str):
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    return {
+        "filename": filename,
+        "upload_dir": UPLOAD_DIR,
+        "full_path": file_path,
+        "exists": os.path.exists(file_path),
+        "files_in_upload_dir": os.listdir(UPLOAD_DIR) if os.path.exists(UPLOAD_DIR) else []
+    }
+
+# Custom video serving endpoint with range request support
+@app.get("/video/{filename:path}")
+async def serve_video(filename: str, request: Request):
+    """
+    Serve video files with proper range request support for seeking.
+    """
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    
+    logger.info(f"=== VIDEO REQUEST DEBUG ===")
+    logger.info(f"Request URL: {request.url}")
+    logger.info(f"Request headers: {dict(request.headers)}")
+    logger.info(f"Video request for: {filename}")
+    logger.info(f"UPLOAD_DIR: {UPLOAD_DIR}")
+    logger.info(f"Looking for file at: {file_path}")
+    logger.info(f"File exists: {os.path.exists(file_path)}")
+    
+    # List files in uploads directory for debugging
+    try:
+        upload_files = os.listdir(UPLOAD_DIR)
+        logger.info(f"Files in uploads directory: {upload_files}")
+    except Exception as e:
+        logger.error(f"Error listing uploads directory: {e}")
+    
+    if not os.path.exists(file_path):
+        logger.error(f"Video file not found: {file_path}")
+        return Response(status_code=404, content="Video not found")
+    
+    file_size = os.path.getsize(file_path)
+    logger.info(f"Video file size: {file_size} bytes")
+    
+    # Check if this is a range request
+    range_header = request.headers.get("range")
+    logger.info(f"Range header: {range_header}")
+    
+    if not range_header:
+        # No range request - serve the full file
+        logger.info("Serving full video file")
+        def file_generator():
+            with open(file_path, "rb") as f:
+                while chunk := f.read(8192):
+                    yield chunk
+        
+        return StreamingResponse(
+            file_generator(),
+            media_type="video/mp4",
+            headers={
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD",
+                "Access-Control-Allow-Headers": "Range"
+            }
+        )
+    
+    # Parse range header (e.g., "bytes=0-1023")
+    try:
+        range_type, range_spec = range_header.split("=")
+        if range_type.lower() != "bytes":
+            return Response(status_code=400, content="Invalid range type")
+        
+        start, end = range_spec.split("-")
+        start = int(start) if start else 0
+        end = int(end) if end else file_size - 1
+        
+        logger.info(f"Range request: {start}-{end} of {file_size}")
+        
+        # Validate range
+        if start >= file_size or end >= file_size or start > end:
+            return Response(status_code=416, content="Range not satisfiable")
+        
+        content_length = end - start + 1
+        
+        def range_generator():
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk_size = min(8192, remaining)
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+                    remaining -= len(chunk)
+        
+        logger.info(f"Serving range: {start}-{end} ({content_length} bytes)")
+        return StreamingResponse(
+            range_generator(),
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(content_length),
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD",
+                "Access-Control-Allow-Headers": "Range"
+            },
+            status_code=206
+        )
+        
+    except (ValueError, IndexError) as e:
+        logger.error(f"Invalid range header: {range_header}, error: {e}")
+        return Response(status_code=400, content="Invalid range header")
 
 # In-memory mapping of file_id → absolute video file path created by /analyze.
 file_store: Dict[str, str] = {}

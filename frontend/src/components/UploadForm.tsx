@@ -279,7 +279,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
         {activeStep === 3 && originalName && jobId && (
           <>
             <VideoScrubber
-              videoUrl={`/uploads/${jobId}_${encodeURIComponent(originalName)}`}
+              videoUrl={`/video/${jobId}_${encodeURIComponent(originalName)}`}
               onConfirm={(inn, out) => {
                 setValue('scopeStart', inn);
                 setValue('scopeEnd', out);
