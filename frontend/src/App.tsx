@@ -1,35 +1,59 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { QueryClient, QueryClientProvider, useMutation } from '@tanstack/react-query';
+import axios from 'axios';
+import UploadForm from './components/UploadForm';
+import type { UploadFormValues } from './components/UploadForm';
+import { Container, CssBaseline, Snackbar, Alert } from '@mui/material';
+import { useState } from 'react';
+
+const queryClient = new QueryClient();
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: 'success' | 'error' }>({
+    open: false,
+    message: '',
+    severity: 'success',
+  });
+
+  const processVideo = async (data: UploadFormValues) => {
+    const formData = new FormData();
+    if (data.fileId) {
+      formData.append('file_id', data.fileId);
+    } else {
+      formData.append('file', data.video[0]);
+    }
+    if (data.scopeStart !== undefined) formData.append('scope_start_seconds', String(data.scopeStart));
+    if (data.scopeEnd !== undefined) formData.append('scope_end_seconds', String(data.scopeEnd));
+    if (data.audioTrack !== undefined) formData.append('audio_track', String(data.audioTrack));
+    const response = await axios.post('/process', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  };
+
+  const mutation = useMutation({
+    mutationFn: processVideo,
+    onSuccess: () => setSnackbar({ open: true, message: 'Processing started successfully', severity: 'success' }),
+    onError: (err: any) => setSnackbar({ open: true, message: err.message ?? 'Error', severity: 'error' }),
+  });
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    <QueryClientProvider client={queryClient}>
+      <CssBaseline />
+      <Container maxWidth="md" sx={{ py: 4 }}>
+        <UploadForm onSubmit={(values) => mutation.mutate(values)} isSubmitting={mutation.isPending} />
+      </Container>
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={4000}
+        onClose={() => setSnackbar((s) => ({ ...s, open: false }))}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert severity={snackbar.severity} variant="filled" sx={{ width: '100%' }}>
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
+    </QueryClientProvider>
+  );
 }
 
-export default App
+export default App;

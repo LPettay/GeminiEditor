@@ -15,7 +15,9 @@ import asyncio # Added for running sync Gemini functions in thread pool
 from typing import Optional, List, Tuple, Dict, Any
 import glob # For finding files
 import re # For parsing timestamps from filenames
-import subprocess # Added for running ffmpeg in a thread on Windows
+import subprocess # Added for running ffmpeg and audiowaveform in a thread on Windows
+import uuid
+from fastapi.staticfiles import StaticFiles
 
 # Changed import for new Gemini functions
 from .gemini import (
@@ -119,20 +121,250 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 os.makedirs(PROCESSED_AUDIO_DIR, exist_ok=True)
 
-# Define an Enum for Whisper model choices
-# class WhisperModel(str, Enum): # No longer needed here, will pass model name as string
-#     \"\"\"Available Whisper model sizes for transcription.\"\"\"
-#     tiny = "tiny"
-#     base = "base"
-#     small = "small"
-#     medium = "medium"
-#     large = "large"
-#     large_v2 = "large-v2"
-#     large_v3 = "large-v3"
+# Directory for temporary preview clips that the user can listen to when choosing an audio track.
+PREVIEW_DIR = os.path.join(_project_root, "tmp", "previews")
+os.makedirs(PREVIEW_DIR, exist_ok=True)
+
+# Mount the preview directory so files can be streamed by the browser.
+app.mount("/previews", StaticFiles(directory=PREVIEW_DIR), name="previews")
+
+# In-memory mapping of file_id → absolute video file path created by /analyze.
+file_store: Dict[str, str] = {}
+
+# Path to audiowaveform binary – prefer project-local tools copy
+_local_audiowf = os.path.join(_project_root, "tools", "audiowaveform.exe")
+AUDIOWAVEFORM_BIN = _local_audiowf if os.path.exists(_local_audiowf) else "audiowaveform"
+
+# Function to generate peaks JSON using audiowaveform
+def generate_peaks(mp3_path: str, json_path: str):
+    cmd = [
+        AUDIOWAVEFORM_BIN,
+        "-i", mp3_path,
+        "-o", json_path,
+        "-z", "256",  # samples per pixel
+        "-b", "8",    # 8-bit peaks (tiny)
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except FileNotFoundError:
+        logger.error("audiowaveform binary not found (looked for project tools copy or system PATH). Peaks will be missing.")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"audiowaveform failed on {mp3_path}: {e}")
+
+# Helper to detect first loud segment (defined before use)
+def detect_first_loud(input_file: str, stream_index: int, max_scan_seconds: int = 900) -> float | None:
+    sd_cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-i", input_file,
+        "-map", f"0:{stream_index}",
+        "-af", "silencedetect=n=-50dB:d=1", "-t", str(max_scan_seconds),
+        "-f", "null", "-",
+    ]
+    try:
+        res = subprocess.run(sd_cmd, capture_output=True, text=True, check=True)
+        output = res.stderr
+    except subprocess.CalledProcessError as e:
+        output = e.stderr  # silencedetect returns non-zero when piped to null
+
+    first_loud: float | None = 0.0  # assume starts loud
+    for line in output.splitlines():
+        if "silence_end:" in line:
+            try:
+                ts_part = line.split("silence_end:")[1].split()[0]
+                first_loud = float(ts_part)
+                break
+            except ValueError:
+                continue
+    # If we only saw silence_start but no silence_end ==> always silent
+    if "silence_start" in output and "silence_end" not in output:
+        return None
+    return first_loud
+
+# --- Progress streaming setup ---
+# In-memory queues: job_id -> asyncio.Queue of event dicts {text: str, type?: str, payload?: Any}
+progress_queues: Dict[str, "asyncio.Queue[dict]"] = {}
+
+# Utility to emit progress events
+async def emit_progress(job_id: str, message: dict):
+    queue = progress_queues.get(job_id)
+    if queue:
+        await queue.put(message)
+
+# Background task that performs audio analysis and sends progress events
+async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
+    try:
+        await emit_progress(job_id, {"text": "Probing streams"})
+
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_streams", "-print_format", "json",
+            input_path,
+        ]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            probe_cmd,
+            capture_output=True,
+            text=True,
+        )
+        stdout, stderr = result.stdout, result.stderr
+        if result.returncode != 0:
+            logger.error(f"ffprobe failed: {stderr}")
+            await emit_progress(job_id, {"text": "ffprobe failed", "type": "error"})
+            return
+
+        probe_json = json.loads(stdout)
+
+        stream_meta: List[Dict[str, Any]] = []
+        for stream in probe_json.get("streams", []):
+            stream_meta.append({
+                "idx": stream.get("index"),
+                "codec": stream.get("codec_name"),
+                "channels": stream.get("channels"),
+                "duration": float(stream.get("duration", 0)),
+                "lang": stream.get("tags", {}).get("language", "und"),
+            })
+
+        if not stream_meta:
+            await emit_progress(job_id, {"text": "No audio streams found", "type": "done", "payload": {"file_id": job_id, "tracks": []}})
+            return
+
+        tracks: List[Dict[str, Any]] = []
+
+        for meta in stream_meta:
+            idx = meta["idx"]
+            await emit_progress(job_id, {"text": f"Extracting preview for track {idx}"})
+            preview_filename = f"{job_id}_{idx}.mp3"
+            preview_path = os.path.join(PREVIEW_DIR, preview_filename)
+            in_dur = meta.get("duration", 0)
+            duration = preview_duration if preview_duration > 0 else in_dur
+            start_ts = 0
+            # detect first loud segment
+            first_loud = detect_first_loud(input_path, idx)
+            if first_loud is None:
+                # All silence
+                await emit_progress(job_id, {"text": f"Track {idx} is silent – skipping"})
+                continue
+            start_ts = first_loud
+
+            ff_cmd = [
+                "ffmpeg", "-nostdin", "-y",
+                "-i", input_path,
+                "-map", f"0:{idx}",
+                "-ss", str(start_ts),
+            ]
+            if duration > 0:
+                ff_cmd += ["-t", str(duration)]
+            ff_cmd += ["-vn", "-acodec", "mp3", "-b:a", "128k", preview_path]
+
+            logger.info(f"Running ffmpeg command: {' '.join(ff_cmd)}")
+            
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ff_cmd,
+                    capture_output=True,
+                    text=True,
+                )
+                
+                if result.returncode != 0:
+                    logger.error(f"ffmpeg failed with return code {result.returncode}")
+                    logger.error(f"ffmpeg stderr: {result.stderr}")
+                    logger.error(f"ffmpeg stdout: {result.stdout}")
+                else:
+                    logger.info(f"ffmpeg completed successfully")
+                    
+            except Exception as e:
+                logger.error(f"Exception running ffmpeg: {e}")
+
+            # Verify file was created
+            if os.path.exists(preview_path):
+                file_size = os.path.getsize(preview_path)
+                logger.info(f"Created preview file: {preview_filename} ({file_size} bytes)")
+            else:
+                logger.error(f"Failed to create preview file: {preview_path}")
+                logger.error(f"ffmpeg command was: {' '.join(ff_cmd)}")
+
+            track_entry = {
+                **meta,
+                "snippet_url": f"/previews/{preview_filename}",
+            }
+            tracks.append(track_entry)
+
+        payload = {"file_id": job_id, "tracks": tracks}
+        await emit_progress(job_id, {"text": "done", "type": "done", "payload": payload})
+
+    except Exception as e:
+        logger.exception("Analysis worker exception")
+        await emit_progress(job_id, {"text": f"Error: {e}", "type": "error"})
+    finally:
+        # Cleanup queue
+        await asyncio.sleep(0.1)
+        progress_queues.pop(job_id, None)
+
+
+# SSE endpoint
+from fastapi.responses import StreamingResponse
+
+
+@app.get("/progress/{job_id}")
+async def progress_stream(job_id: str):
+    queue = progress_queues.get(job_id)
+    if queue is None:
+        return JSONResponse(status_code=404, content={"message": "Job not found"})
+
+    async def event_generator():
+        while True:
+            msg = await queue.get()
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg.get("type") == "done":
+                break
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# ------------------------------------------------------------
+# Audio-track pre-check – analyse a freshly uploaded video and
+# return metadata + short MP3 previews for each audio stream.
+# ------------------------------------------------------------
+
+
+@app.post("/analyze")
+async def analyze_video(
+    file: UploadFile = File(...),
+    preview_duration: int = Form(20, description="Length of each audio preview in seconds. Use 0 or negative to include full track.")
+):
+    """Inspect an uploaded video, list its audio tracks and expose 20-second previews.
+
+    The client can later call /process with the returned *file_id* and the chosen
+    *audio_track* index to skip re-uploading the large video file.
+    """
+
+    # Save upload to disk with a unique prefix so multiple concurrent uploads don't clash.
+    file_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Record mapping for later reuse by /process
+    file_store[file_id] = input_path
+
+    # Create progress queue for this job
+    progress_queues[file_id] = asyncio.Queue()
+
+    # Start a background task to perform audio analysis and send progress events
+    asyncio.create_task(analyze_worker(file_id, input_path, preview_duration))
+
+    return {"job_id": file_id}
+
+# ------------------------------------------------------------
+# Existing /process endpoint below – signature extended to
+# accept *file_id* and optional *file* upload.
+# ------------------------------------------------------------
 
 @app.post("/process")
 async def process_video(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    file_id: str | None = Form(None, description="Identifier of a previously uploaded video returned by /analyze"),
     prompt: str = Form(""), # User prompt for Gemini
     audio_track: int = Form(0, ge=0, description="The 0-indexed audio track to use from the video."),
     produce_video: bool = Form(True),
@@ -236,16 +468,31 @@ async def process_video(
         logger.info(f"Starting processing for file: {file.filename}")
         run_timestamp = time.strftime("%Y%m%d_%H%M%S")
         
-        input_path = os.path.join(UPLOAD_DIR, file.filename)
-        if not os.path.exists(input_path):
-            logger.info(f"Saving uploaded file to: {input_path}")
-            with open(input_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            logger.info("File saved successfully")
-        else:
-            logger.info(f"Using existing file: {input_path}")
+        # Resolve the video source – either freshly uploaded or referenced by *file_id*
+        if file is not None:
+            input_path = os.path.join(UPLOAD_DIR, file.filename)
+            if not os.path.exists(input_path):
+                logger.info(f"Saving uploaded file to: {input_path}")
+                with open(input_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+                logger.info("File saved successfully")
+            else:
+                logger.info(f"Using existing file on disk: {input_path}")
 
-        base_name = os.path.splitext(file.filename)[0]
+            # Register a mapping so the UI can reference this video later if needed
+            generated_file_id = str(uuid.uuid4())
+            file_store[generated_file_id] = input_path
+            logger.info(f"Assigned file_id {generated_file_id} to uploaded file")
+
+        elif file_id is not None:
+            if file_id not in file_store:
+                return JSONResponse(status_code=400, content={"message": f"Unknown file_id '{file_id}'"})
+            input_path = file_store[file_id]
+            logger.info(f"Using previously uploaded file via file_id {file_id}: {input_path}")
+        else:
+            return JSONResponse(status_code=400, content={"message": "Either 'file' or 'file_id' must be provided."})
+
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
 
         # --- OPTIONAL SCOPE PRE-TRIM -------------------------------------
         if scope_start_seconds is not None and scope_end_seconds is not None:
@@ -810,26 +1057,19 @@ async def process_video(
                 # For candidate video, we likely always want a fresh transcript unless a very specific reuse is implemented
                 logger.info(f"Transcribing candidate video: {candidate_video_path}")
                 try:
-                    # transcribe_video from whisper_utils returns: (transcript_data_dict, structured_segments_list, saved_json_path, source_message)
-                    cand_transcript_data_dict, cand_struct_segments, _, _ = await asyncio.to_thread(
-                        transcribe_video, 
+                    cand_transcript_result = await asyncio.to_thread(
+                        transcribe_video,
                         video_path=candidate_video_path,
-                        # model_name, language, etc. should come from app_config or be sensible defaults for candidate video
-                        model_name=app_config.transcription_config.model_name, 
+                        model_name=app_config.transcription_config.model_name,
                         language=app_config.transcription_config.language,
-                        audio_track=0, # Candidate video usually has one processed audio track
+                        audio_track=0,
                         silence_duration=app_config.audio_config.min_silence_duration,
                         silence_threshold=app_config.audio_config.silence_threshold,
-                        save_speech_audio_path=None, # Don't save speech audio for candidate video
-                        # output_dir and base_output_name inside transcribe_video will handle json saving.
-                        # We force a new transcription for candidate video for now to ensure freshness.
-                        force_new_transcription=True,
-                        # Provide explicit paths for saving inside transcribe_video if that util supports it, 
-                        # otherwise, it saves based on its internal logic and we confirm path after.
-                        # The function currently saves to output_dir with base_output_name + _full_transcription.json
-                        base_output_name = candidate_video_basename, # To make predictable_cand_transcript_json_path the save path
-                        output_dir = TRANSCRIPTS_DIR
+                        save_speech_audio_path=None,
                     )
+
+                    cand_transcript_data_dict = cand_transcript_result
+                    cand_struct_segments = cand_transcript_result.get('segments', []) if cand_transcript_result else []
 
                     if cand_struct_segments:
                         candidate_video_transcript_segments = cand_struct_segments
@@ -1136,3 +1376,12 @@ async def process_video(
     except Exception as e:
         logger.error(f"Critical error during processing of {file.filename}: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"message": f"Error processing file: {str(e)}"}) 
+
+@app.get("/test-preview/{filename}")
+async def test_preview(filename: str):
+    """Test endpoint to check if a preview file exists"""
+    file_path = os.path.join(PREVIEW_DIR, filename)
+    if os.path.exists(file_path):
+        return {"exists": True, "size": os.path.getsize(file_path), "path": file_path}
+    else:
+        return {"exists": False, "path": file_path}
