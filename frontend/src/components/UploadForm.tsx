@@ -16,7 +16,7 @@ import {
 import { useMutation } from '@tanstack/react-query';
 import axios from 'axios';
 import { useEffect, useState } from 'react';
-import AudioPreview from './AudioPreview';
+import WaveformPreview from './WaveformPreview';
 import DebugPanel from './DebugPanel';
 
 export interface UploadFormValues {
@@ -60,7 +60,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     mutationFn: async (file: File) => {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('preview_duration', String(-1));
+      fd.append('preview_duration', String(20)); // 20 second previews
       const res = await axios.post('/analyze', fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
         onUploadProgress: (e) => {
@@ -238,7 +238,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
                       label={
                         <Stack direction="row" spacing={2} alignItems="center">
                           <Box sx={{ flexGrow: 1 }}>
-                            <AudioPreview url={t.snippet_url ?? t.preview_url} />
+                            <WaveformPreview url={t.snippet_url ?? t.preview_url} peaksUrl={t.peaks_url} />
                             <Typography variant="caption" color="text.secondary">
                               Track {t.idx} – {t.codec}, {t.channels}ch, {t.lang}
                             </Typography>

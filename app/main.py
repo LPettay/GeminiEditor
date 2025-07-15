@@ -126,6 +126,7 @@ PREVIEW_DIR = os.path.join(_project_root, "tmp", "previews")
 os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 # Mount the preview directory so files can be streamed by the browser.
+# This will serve both MP3 previews and JSON peaks files
 app.mount("/previews", StaticFiles(directory=PREVIEW_DIR), name="previews")
 
 # In-memory mapping of file_id → absolute video file path created by /analyze.
@@ -153,31 +154,118 @@ def generate_peaks(mp3_path: str, json_path: str):
 
 # Helper to detect first loud segment (defined before use)
 def detect_first_loud(input_file: str, stream_index: int, max_scan_seconds: int = 900) -> float | None:
-    sd_cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-i", input_file,
-        "-map", f"0:{stream_index}",
-        "-af", "silencedetect=n=-50dB:d=1", "-t", str(max_scan_seconds),
-        "-f", "null", "-",
-    ]
-    try:
-        res = subprocess.run(sd_cmd, capture_output=True, text=True, check=True)
-        output = res.stderr
-    except subprocess.CalledProcessError as e:
-        output = e.stderr  # silencedetect returns non-zero when piped to null
+    """
+    Efficiently detect the first loud segment in an audio stream.
+    Uses progressive scanning to find audio quickly.
+    Filters out brief audio blips to find sustained audio content.
+    """
+    # Start with a small scan window for quick detection
+    initial_scan_seconds = 30  # 30 seconds should be enough for most content
+    
+    # Progressive scan windows: 30s, 2min, 5min, then max_scan_seconds
+    scan_windows = [initial_scan_seconds, 120, 300, max_scan_seconds]
+    
+    for scan_duration in scan_windows:
+        scan_start = time.time()
+        logger.debug(f"Scanning first {scan_duration}s for audio...")
+        
+        # Use a more sensitive approach to detect actual audio start
+        # Lower threshold and shorter silence duration to catch early audio
+        sd_cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-i", input_file,
+            "-map", f"0:{stream_index}",
+            # Use a slightly stricter threshold and longer min-silence to avoid
+            # treating quiet background hiss as audio.
+            "-af", "silencedetect=n=-35dB:d=1.5",
+            "-t", str(scan_duration),
+            "-f", "null", "-",
+        ]
+        
+        try:
+            res = subprocess.run(sd_cmd, capture_output=True, text=True, check=True)
+            output = res.stderr
+        except subprocess.CalledProcessError as e:
+            output = e.stderr  # silencedetect returns non-zero when piped to null
 
-    first_loud: float | None = 0.0  # assume starts loud
-    for line in output.splitlines():
-        if "silence_end:" in line:
-            try:
-                ts_part = line.split("silence_end:")[1].split()[0]
-                first_loud = float(ts_part)
-                break
-            except ValueError:
-                continue
-    # If we only saw silence_start but no silence_end ==> always silent
-    if "silence_start" in output and "silence_end" not in output:
-        return None
-    return first_loud
+        scan_time = time.time() - scan_start
+        logger.debug(f"Scan of {scan_duration}s completed in {scan_time:.2f}s")
+
+        # Parse all silence_start and silence_end events to find sustained audio
+        silence_events = []
+        for line in output.splitlines():
+            if "silence_start:" in line:
+                try:
+                    ts_part = line.split("silence_start:")[1].split()[0]
+                    silence_events.append(("start", float(ts_part)))
+                except ValueError:
+                    continue
+            elif "silence_end:" in line:
+                try:
+                    ts_part = line.split("silence_end:")[1].split()[0]
+                    silence_events.append(("end", float(ts_part)))
+                except ValueError:
+                    continue
+        
+        # Sort events by timestamp
+        silence_events.sort(key=lambda x: x[1])
+        
+        # Debug: Log all silence events
+        logger.debug(f"Silence events for scan {scan_duration}s: {silence_events}")
+        
+        # More detailed debug logging
+        if silence_events:
+            logger.info(f"Track {stream_index}: Found {len(silence_events)} silence events in first {scan_duration}s")
+            for i, (event_type, timestamp) in enumerate(silence_events[:5]):  # Log first 5 events
+                logger.info(f"Track {stream_index}: Event {i+1}: {event_type} at {timestamp:.3f}s")
+        else:
+            logger.info(f"Track {stream_index}: No silence events detected in first {scan_duration}s")
+        
+        # Analyze silence events to find the actual audio start
+        if not silence_events:
+            # No silence events detected in this window – expand scan window to be certain
+            logger.debug(f"No silence events detected in first {scan_duration}s, expanding scan...")
+            continue
+        
+        # Identify candidate audio starts – a silence_end that occurs **well before** the
+        # end of the scan window. If it lands right at the window boundary it usually
+        # means the scan simply ended while we were still in silence.
+        margin = 2.0  # seconds from end of window that we treat as "boundary"
+        candidate_start = None
+        for ev_type, ts in silence_events:
+            if ev_type == "end" and ts < (scan_duration - margin):
+                candidate_start = ts
+                break  # earliest good candidate
+
+        if candidate_start is not None:
+            logger.info(
+                f"Found audio start at {candidate_start:.3f}s from silence_end (margin {margin}s)"
+            )
+            return candidate_start
+        
+        # If we only have silence_start events but no silence_end events,
+        # it means audio started at 0.0s and silence began later
+        silence_starts = [timestamp for event_type, timestamp in silence_events if event_type == "start"]
+        if silence_starts and not silence_events:
+            logger.debug(
+                f"Window {scan_duration}s contains only silence so far – expanding scan..."
+            )
+            continue
+        
+        # If we found audio start in this scan window, return it
+        # Otherwise continue to next scan window
+        if silence_events:
+            # We already processed this above and should have returned
+            # If we get here, it means no clear pattern was found
+            logger.debug(f"No clear audio pattern found in first {scan_duration}s, expanding scan...")
+            continue
+        
+        # Fallback: no clear pattern, assume audio starts at 0.0s
+        logger.info("No clear audio pattern detected, assuming audio starts at 0.0s")
+        return 0.0
+    
+    # If we scanned the full duration and found nothing, assume silent
+    logger.info("No audio detected in any scan window, assuming silent track")
+    return None
 
 # --- Progress streaming setup ---
 # In-memory queues: job_id -> asyncio.Queue of event dicts {text: str, type?: str, payload?: Any}
@@ -191,8 +279,10 @@ async def emit_progress(job_id: str, message: dict):
 
 # Background task that performs audio analysis and sends progress events
 async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
+    start_time = time.time()
     try:
         await emit_progress(job_id, {"text": "Probing streams"})
+        probe_start = time.time()
 
         probe_cmd = [
             "ffprobe", "-v", "error",
@@ -212,6 +302,10 @@ async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
             await emit_progress(job_id, {"text": "ffprobe failed", "type": "error"})
             return
 
+        probe_time = time.time() - probe_start
+        logger.info(f"Stream probing completed in {probe_time:.2f}s")
+        await emit_progress(job_id, {"text": f"Stream probing completed in {probe_time:.2f}s"})
+
         probe_json = json.loads(stdout)
 
         stream_meta: List[Dict[str, Any]] = []
@@ -221,8 +315,12 @@ async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
                 "codec": stream.get("codec_name"),
                 "channels": stream.get("channels"),
                 "duration": float(stream.get("duration", 0)),
+                "start_time": float(stream.get("start_time", 0) or 0),
                 "lang": stream.get("tags", {}).get("language", "und"),
             })
+
+        logger.info(f"Found {len(stream_meta)} audio tracks")
+        await emit_progress(job_id, {"text": f"Found {len(stream_meta)} audio tracks"})
 
         if not stream_meta:
             await emit_progress(job_id, {"text": "No audio streams found", "type": "done", "payload": {"file_id": job_id, "tracks": []}})
@@ -230,31 +328,79 @@ async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
 
         tracks: List[Dict[str, Any]] = []
 
-        for meta in stream_meta:
+        for track_idx, meta in enumerate(stream_meta):
             idx = meta["idx"]
-            await emit_progress(job_id, {"text": f"Extracting preview for track {idx}"})
+            track_start_time = time.time()
+            
+            await emit_progress(job_id, {"text": f"Processing track {idx} ({track_idx + 1}/{len(stream_meta)})"})
+            
             preview_filename = f"{job_id}_{idx}.mp3"
             preview_path = os.path.join(PREVIEW_DIR, preview_filename)
             in_dur = meta.get("duration", 0)
             duration = preview_duration if preview_duration > 0 else in_dur
             start_ts = 0
-            # detect first loud segment
-            first_loud = detect_first_loud(input_path, idx)
-            if first_loud is None:
-                # All silence
-                await emit_progress(job_id, {"text": f"Track {idx} is silent – skipping"})
-                continue
-            start_ts = first_loud
-
+            
+            # Prefer FFprobe-reported stream start_time if present (>1s)
+            start_ts = meta.get("start_time", 0) or 0
+            if start_ts < 1.0:
+                # Fallback to audio-content analysis
+                await emit_progress(job_id, {"text": f"Detecting audio start for track {idx}..."})
+                detection_start = time.time()
+                first_loud = detect_first_loud(input_path, idx)
+                detection_time = time.time() - detection_start
+                if first_loud is None:
+                    await emit_progress(job_id, {"text": f"Track {idx} is silent – skipping (detection took {detection_time:.2f}s)"})
+                    continue
+                start_ts = first_loud
+            else:
+                logger.info(f"Track {idx}: Using FFprobe start_time {start_ts:.3f}s")
+                detection_time = 0.0
+            
+            await emit_progress(job_id, {"text": f"Audio starts at {start_ts:.2f}s (detection took {detection_time:.2f}s)"})
+            
+            # Debug info for immediate audio tracks
+            if start_ts < 1.0:  # If audio starts within first second
+                logger.info(f"Track {idx}: Immediate audio detected at {start_ts:.3f}s")
+                await emit_progress(job_id, {"text": f"Track {idx}: Immediate audio at {start_ts:.3f}s"})
+            else:
+                logger.info(f"Track {idx}: Delayed audio detected at {start_ts:.2f}s")
+                await emit_progress(job_id, {"text": f"Track {idx}: Delayed audio at {start_ts:.2f}s"})
+            
+            # Calculate extraction parameters with smart duration adjustment
+            # For late audio, extract longer segments to ensure we get enough content
+            if start_ts > 60:  # If audio starts after 1 minute
+                # Extract longer segment for late audio
+                adjusted_duration = min(duration * 3, 60)  # Up to 60 seconds for late audio
+            else:
+                adjusted_duration = duration
+            
+            # Add small padding before audio start to capture beginning of speech
+            # This helps catch the first few words that might be cut off
+            padding_before = 0.5  # 0.5 seconds before detected start
+            actual_start = max(0.0, start_ts - padding_before)
+            
+            # Additional debug info
+            logger.info(f"Track {idx}: Final start_ts = {start_ts:.3f}s, actual_start = {actual_start:.3f}s (with {padding_before}s padding)")
+            
+            await emit_progress(job_id, {"text": f"Extracting {adjusted_duration}s preview from {actual_start:.1f}s..."})
+            extraction_start = time.time()
+            
             ff_cmd = [
                 "ffmpeg", "-nostdin", "-y",
+                "-ss", str(actual_start),  # Seek before input for faster seeking
                 "-i", input_path,
                 "-map", f"0:{idx}",
-                "-ss", str(start_ts),
             ]
-            if duration > 0:
-                ff_cmd += ["-t", str(duration)]
-            ff_cmd += ["-vn", "-acodec", "mp3", "-b:a", "128k", preview_path]
+            if adjusted_duration > 0:
+                ff_cmd += ["-t", str(adjusted_duration)]
+            ff_cmd += [
+                "-vn",  # No video
+                "-acodec", "mp3", 
+                "-b:a", "128k",
+                "-preset", "ultrafast",  # Fastest encoding preset
+                "-threads", "0",  # Use all available CPU threads
+                preview_path
+            ]
 
             logger.info(f"Running ffmpeg command: {' '.join(ff_cmd)}")
             
@@ -266,40 +412,83 @@ async def analyze_worker(job_id: str, input_path: str, preview_duration: int):
                     text=True,
                 )
                 
+                extraction_time = time.time() - extraction_start
+                
                 if result.returncode != 0:
                     logger.error(f"ffmpeg failed with return code {result.returncode}")
                     logger.error(f"ffmpeg stderr: {result.stderr}")
                     logger.error(f"ffmpeg stdout: {result.stdout}")
+                    await emit_progress(job_id, {"text": f"FFmpeg failed for track {idx} (extraction took {extraction_time:.2f}s)"})
                 else:
-                    logger.info(f"ffmpeg completed successfully")
+                    logger.info(f"ffmpeg completed successfully in {extraction_time:.2f}s")
+                    await emit_progress(job_id, {"text": f"Preview extracted in {extraction_time:.2f}s"})
                     
             except Exception as e:
+                extraction_time = time.time() - extraction_start
                 logger.error(f"Exception running ffmpeg: {e}")
+                await emit_progress(job_id, {"text": f"FFmpeg exception for track {idx} (extraction took {extraction_time:.2f}s)"})
 
             # Verify file was created
             if os.path.exists(preview_path):
                 file_size = os.path.getsize(preview_path)
                 logger.info(f"Created preview file: {preview_filename} ({file_size} bytes)")
+                
+                # Generate waveform peaks for the preview
+                await emit_progress(job_id, {"text": f"Generating waveform for track {idx}..."})
+                peaks_start = time.time()
+                
+                peaks_filename = f"{job_id}_{idx}_peaks.json"
+                peaks_path = os.path.join(PREVIEW_DIR, peaks_filename)
+                
+                try:
+                    await asyncio.to_thread(generate_peaks, preview_path, peaks_path)
+                    peaks_time = time.time() - peaks_start
+                    logger.info(f"Generated waveform peaks in {peaks_time:.2f}s")
+                    await emit_progress(job_id, {"text": f"Waveform generated in {peaks_time:.2f}s"})
+                    
+                    # Add peaks URL to track entry
+                    peaks_url = f"/previews/{peaks_filename}"
+                except Exception as e:
+                    peaks_time = time.time() - peaks_start
+                    logger.warning(f"Failed to generate waveform peaks for track {idx}: {e}")
+                    await emit_progress(job_id, {"text": f"Waveform generation failed (took {peaks_time:.2f}s)"})
+                    peaks_url = None
+                
             else:
                 logger.error(f"Failed to create preview file: {preview_path}")
                 logger.error(f"ffmpeg command was: {' '.join(ff_cmd)}")
+                peaks_url = None
+
+            track_time = time.time() - track_start_time
+            logger.info(f"Track {idx} completed in {track_time:.2f}s total (detection: {detection_time:.2f}s, extraction: {extraction_time:.2f}s)")
+            await emit_progress(job_id, {"text": f"Track {idx} completed in {track_time:.2f}s"})
 
             track_entry = {
                 **meta,
                 "snippet_url": f"/previews/{preview_filename}",
+                "peaks_url": peaks_url,
             }
             tracks.append(track_entry)
 
+        total_time = time.time() - start_time
+        logger.info(f"All tracks processed in {total_time:.2f}s total")
+        await emit_progress(job_id, {"text": f"All tracks processed in {total_time:.2f}s"})
+        
         payload = {"file_id": job_id, "tracks": tracks}
         await emit_progress(job_id, {"text": "done", "type": "done", "payload": payload})
 
     except Exception as e:
-        logger.exception("Analysis worker exception")
-        await emit_progress(job_id, {"text": f"Error: {e}", "type": "error"})
+        total_time = time.time() - start_time
+        logger.exception(f"Analysis worker exception after {total_time:.2f}s")
+        try:
+            await emit_progress(job_id, {"text": f"Error after {total_time:.2f}s: {e}", "type": "error"})
+        except Exception as emit_error:
+            logger.error(f"Failed to emit error progress: {emit_error}")
     finally:
-        # Cleanup queue
-        await asyncio.sleep(0.1)
+        # Cleanup queue after a delay to ensure frontend has time to connect
+        await asyncio.sleep(1.0)  # Give frontend more time to connect
         progress_queues.pop(job_id, None)
+        logger.info(f"Cleaned up progress queue for job {job_id}")
 
 
 # SSE endpoint
@@ -353,6 +542,9 @@ async def analyze_video(
 
     # Start a background task to perform audio analysis and send progress events
     asyncio.create_task(analyze_worker(file_id, input_path, preview_duration))
+    
+    # Send initial progress message to ensure queue is working
+    asyncio.create_task(emit_progress(file_id, {"text": "Starting analysis...", "type": "progress"}))
 
     return {"job_id": file_id}
 
