@@ -155,8 +155,20 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
   }, [jobId, setValue]);
 
   return (
-    <Box component="form" onSubmit={handleSubmit(onSubmit)} noValidate>
-      <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 3 }}>
+    <Box 
+      component="form" 
+      onSubmit={handleSubmit(onSubmit)} 
+      noValidate
+      sx={{
+        width: '100%',
+        maxWidth: '600px',
+        mx: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center'
+      }}
+    >
+      <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 3, width: '100%' }}>
         {['Select file', 'Analyzing', 'Pick audio', 'Scope & submit'].map((label) => (
           <Step key={label}>
             <StepLabel>{label}</StepLabel>
@@ -164,7 +176,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
         ))}
       </Stepper>
 
-      <Stack spacing={2}>
+      <Stack spacing={2} sx={{ width: '100%' }}>
         {activeStep === 0 && (
           <Button variant="outlined" component="label">
             Select video file

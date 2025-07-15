@@ -2,10 +2,27 @@ import { QueryClient, QueryClientProvider, useMutation } from '@tanstack/react-q
 import axios from 'axios';
 import UploadForm from './components/UploadForm';
 import type { UploadFormValues } from './components/UploadForm';
-import { Container, CssBaseline, Snackbar, Alert } from '@mui/material';
+import { Container, CssBaseline, Snackbar, Alert, ThemeProvider, createTheme } from '@mui/material';
 import { useState } from 'react';
 
 const queryClient = new QueryClient();
+
+// Create a dark theme
+const darkTheme = createTheme({
+  palette: {
+    mode: 'dark',
+    background: {
+      default: '#121212',
+      paper: '#1e1e1e',
+    },
+    primary: {
+      main: '#90caf9',
+    },
+    secondary: {
+      main: '#f48fb1',
+    },
+  },
+});
 
 function App() {
   const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: 'success' | 'error' }>({
@@ -37,22 +54,34 @@ function App() {
   });
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <CssBaseline />
-      <Container maxWidth="md" sx={{ py: 4 }}>
-        <UploadForm onSubmit={(values) => mutation.mutate(values)} isSubmitting={mutation.isPending} />
-      </Container>
-      <Snackbar
-        open={snackbar.open}
-        autoHideDuration={4000}
-        onClose={() => setSnackbar((s) => ({ ...s, open: false }))}
-        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
-      >
-        <Alert severity={snackbar.severity} variant="filled" sx={{ width: '100%' }}>
-          {snackbar.message}
-        </Alert>
-      </Snackbar>
-    </QueryClientProvider>
+    <ThemeProvider theme={darkTheme}>
+      <QueryClientProvider client={queryClient}>
+        <CssBaseline />
+        <Container 
+          disableGutters
+          sx={{ 
+            py: 4,
+            minHeight: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            alignItems: 'center'
+          }}
+        >
+          <UploadForm onSubmit={(values) => mutation.mutate(values)} isSubmitting={mutation.isPending} />
+        </Container>
+        <Snackbar
+          open={snackbar.open}
+          autoHideDuration={4000}
+          onClose={() => setSnackbar((s) => ({ ...s, open: false }))}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        >
+          <Alert severity={snackbar.severity} variant="filled" sx={{ width: '100%' }}>
+            {snackbar.message}
+          </Alert>
+        </Snackbar>
+      </QueryClientProvider>
+    </ThemeProvider>
   );
 }
 
