@@ -129,6 +129,9 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 # This will serve both MP3 previews and JSON peaks files
 app.mount("/previews", StaticFiles(directory=PREVIEW_DIR), name="previews")
 
+# Serve original uploads so UI can preview full video for scrubbing
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 # In-memory mapping of file_id → absolute video file path created by /analyze.
 file_store: Dict[str, str] = {}
 

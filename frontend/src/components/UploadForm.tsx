@@ -18,6 +18,7 @@ import axios from 'axios';
 import { useEffect, useState } from 'react';
 import WaveformPreview from './WaveformPreview';
 import DebugPanel from './DebugPanel';
+import VideoScrubber from './VideoScrubber';
 
 export interface UploadFormValues {
   video: FileList;
@@ -26,6 +27,9 @@ export interface UploadFormValues {
   audioTrack?: number;
   fileId?: string;
 }
+
+// utility to extract filename from FileList
+const emptyFileList: FileList = new DataTransfer().files;
 
 interface Props {
   onSubmit: (data: UploadFormValues) => void;
@@ -53,6 +57,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
   const [logLines, setLogLines] = useState<string[]>([]);
   // UI step: 0=file select, 1=upload/analyze, 2=audio track, 3=scope & submit
   const [activeStep, setActiveStep] = useState(0);
+  const [originalName, setOriginalName] = useState<string | null>(null);
 
   // Waveform peaks are no longer needed
 
@@ -103,6 +108,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     if (watchedFiles && watchedFiles.length > 0) {
       setActiveStep(1);
       analyzeMutation.mutate(watchedFiles[0]);
+      setOriginalName(watchedFiles[0].name);
     } else {
       setActiveStep(0);
     }
@@ -118,10 +124,11 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'done') {
-          const payload = msg.payload as { file_id: string; tracks: any[] };
+          const payload = msg.payload as { file_id: string; tracks: any[]; original_filename?: string };
           setIsProcessing(false);
           setAnalysisDone(true);
           setTracks(payload.tracks);
+          if (payload.original_filename) setOriginalName(payload.original_filename);
           setValue('fileId', payload.file_id);
           if (payload.tracks?.length) {
             setValue('audioTrack', payload.tracks[0].idx);
@@ -257,10 +264,16 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
           </>
         )}
 
-        {activeStep === 3 && (
+        {activeStep === 3 && originalName && jobId && (
           <>
-            {/* Scope inputs are already rendered above */}
-            <Button type="submit" variant="contained" disabled={isSubmitting}>
+            <VideoScrubber
+              videoUrl={`/uploads/${jobId}_${encodeURIComponent(originalName)}`}
+              onConfirm={(inn, out) => {
+                setValue('scopeStart', inn);
+                setValue('scopeEnd', out);
+              }}
+            />
+            <Button type="submit" variant="contained" disabled={isSubmitting} sx={{ mt: 2 }}>
               {isSubmitting ? 'Processing…' : 'Start Processing'}
             </Button>
           </>

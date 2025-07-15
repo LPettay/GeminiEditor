@@ -17,19 +17,16 @@ export default defineConfig({
       '/previews': {
         target: 'http://localhost:8000',
         changeOrigin: true,
-        configure: (proxy, _options) => {
-          proxy.on('error', (err, _req, _res) => {
-            console.log('proxy error', err);
-          });
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            console.log('Sending request to:', req.method, req.url);
-          });
-        },
+        configure: () => {},
       },
       '/progress': {
         target: 'http://localhost:8000',
         changeOrigin: true,
         ws: false,
+      },
+      '/uploads': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
       },
     },
   },
