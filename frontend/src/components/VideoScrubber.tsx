@@ -1,5 +1,6 @@
 import { Box, Slider, Typography, Stack } from '@mui/material';
 import { useEffect, useRef, useState, useCallback } from 'react';
+import React from 'react';
 
 // Format seconds -> HH:MM:SS
 const fmt = (s: number) => {
@@ -116,11 +117,17 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onRangeChange }) => {
     setRange([start, end]);
     onRangeChange(start, end);
     
-    // Only seek if the start time changed significantly (more than 5 seconds)
-    if (Math.abs(start - currentTime) > 5) {
+    // Don't seek while dragging - let the user finish their drag operation
+  }, [onRangeChange]);
+
+  // Handle when user finishes dragging
+  const handleSliderChangeCommitted = useCallback((_: Event | React.SyntheticEvent, value: number | number[]) => {
+    const [start, end] = value as [number, number];
+    // Seek to the start time when dragging ends
+    if (Math.abs(start - currentTime) > 1) {
       seekTo(start);
     }
-  }, [currentTime, seekTo, onRangeChange]);
+  }, [currentTime, seekTo]);
 
   return (
     <Stack spacing={2} width="100%">
@@ -168,6 +175,7 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onRangeChange }) => {
           <Slider
             value={range}
             onChange={handleSliderChange}
+            onChangeCommitted={handleSliderChangeCommitted}
             min={0}
             max={duration}
             step={0.1}
