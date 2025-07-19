@@ -159,6 +159,16 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onRangeChange }) => {
       const newEnd = Math.max(time, range[0] + 1);
       setRange([range[0], newEnd]);
       onRangeChange(range[0], newEnd);
+      
+      // Also seek to the out point for visual feedback
+      const now = Date.now();
+      if (now - lastSeekTime > 100) { // 100ms = 10 times per second
+        setLastSeekTime(now);
+        const video = videoRef.current;
+        if (video) {
+          video.currentTime = newEnd;
+        }
+      }
     }
   }, [isDragging, duration, range, onRangeChange, lastSeekTime]);
 
