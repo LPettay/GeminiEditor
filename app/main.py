@@ -251,6 +251,74 @@ async def serve_video(filename: str, request: Request):
         logger.error(f"Invalid range header: {range_header}, error: {e}")
         return Response(status_code=400, content="Invalid range header")
 
+# Simple file scanning approach for deduplication
+def find_existing_file_by_metadata(filename: str, size: int, last_modified: int) -> Optional[tuple[str, str]]:
+    """
+    Find existing file by scanning the uploads directory.
+    Returns tuple of (file_id, file_path) if found, None otherwise.
+    Uses only filename and size for deduplication.
+    """
+    if not os.path.exists(UPLOAD_DIR):
+        return None
+    
+    # Scan all files in uploads directory
+    for file_path in os.listdir(UPLOAD_DIR):
+        full_path = os.path.join(UPLOAD_DIR, file_path)
+        if not os.path.isfile(full_path):
+            continue
+        
+        # Extract original filename from UUID-prefixed filename
+        # Format: {file_id}_{original_filename}
+        if '_' not in file_path:
+            continue
+        
+        try:
+            # Split on first underscore to separate UUID from original filename
+            parts = file_path.split('_', 1)
+            if len(parts) != 2:
+                continue
+            
+            file_id, original_filename = parts
+            
+            # Check if this file matches our criteria
+            if original_filename == filename:
+                # Get file size
+                file_size = os.path.getsize(full_path)
+                if file_size == size:
+                    logger.info(f"Found duplicate: {file_path} (size: {file_size})")
+                    return (file_id, full_path)
+        except (OSError, ValueError) as e:
+            logger.warning(f"Error checking file {file_path}: {e}")
+            continue
+    
+    return None
+
+@app.post("/check-duplicate")
+async def check_duplicate(
+    filename: str = Form(...),
+    size: int = Form(...),
+    last_modified: int = Form(...)
+):
+    """Check if a file with the same metadata already exists."""
+    logger.info(f"Checking for duplicate: {filename} ({size} bytes, modified {last_modified})")
+    
+    existing_file = find_existing_file_by_metadata(filename, size, last_modified)
+    
+    if existing_file:
+        file_id, file_path = existing_file
+        logger.info(f"Duplicate found: {file_id}")
+        return {
+            "duplicate": True,
+            "file_id": file_id,
+            "message": f"File '{filename}' has been uploaded before"
+        }
+    else:
+        logger.info(f"No duplicate found for {filename}")
+        return {
+            "duplicate": False,
+            "message": "File is new"
+        }
+
 # In-memory mapping of file_id → absolute video file path created by /analyze.
 file_store: Dict[str, str] = {}
 
@@ -640,7 +708,8 @@ async def progress_stream(job_id: str):
 
 @app.post("/analyze")
 async def analyze_video(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    file_id: str | None = Form(None, description="Identifier of a previously uploaded video to analyze"),
     preview_duration: int = Form(20, description="Length of each audio preview in seconds. Use 0 or negative to include full track.")
 ):
     """Inspect an uploaded video, list its audio tracks and expose 20-second previews.
@@ -649,12 +718,67 @@ async def analyze_video(
     *audio_track* index to skip re-uploading the large video file.
     """
 
+    logger.info(f"=== ANALYZE REQUEST ===")
+    
+    # Handle case where we're analyzing an existing file by file_id
+    if file_id is not None:
+        if file_id not in file_store:
+            return JSONResponse(status_code=400, content={"message": f"Unknown file_id '{file_id}'"})
+        
+        existing_input_path = file_store[file_id]
+        logger.info(f"Analyzing existing file via file_id {file_id}: {existing_input_path}")
+        
+        # Create progress queue for this job
+        progress_queues[file_id] = asyncio.Queue()
+        
+        # Start analysis with existing file
+        asyncio.create_task(analyze_worker(file_id, existing_input_path, preview_duration))
+        asyncio.create_task(emit_progress(file_id, {"text": "Analyzing previously uploaded file...", "type": "progress"}))
+        
+        return {"job_id": file_id, "duplicate": True}
+    
+    # Handle case where we're uploading a new file
+    if file is None:
+        return JSONResponse(status_code=400, content={"message": "Either 'file' or 'file_id' must be provided."})
+    
+    logger.info(f"File: {file.filename}, Size: {file.size} bytes")
+
+    # Check for duplicate using metadata
+    # Note: file.last_modified might not be available, so we'll use current time as fallback
+    last_modified = getattr(file, 'last_modified', int(time.time() * 1000))
+    
+    existing_file = find_existing_file_by_metadata(file.filename, file.size, last_modified)
+    
+    if existing_file:
+        file_id, file_path = existing_file
+        logger.info(f"DUPLICATE DETECTED! File already exists: {file.filename} ({file.size} bytes)")
+        logger.info(f"Existing file_id: {file_id}")
+        logger.info(f"Existing file_path: {file_path}")
+        
+        # Use the existing file
+        existing_file_id = file_id
+        existing_input_path = file_path
+        
+        # Create progress queue for this job (using existing file_id)
+        progress_queues[existing_file_id] = asyncio.Queue()
+        
+        # Start analysis with existing file
+        asyncio.create_task(analyze_worker(existing_file_id, existing_input_path, preview_duration))
+        asyncio.create_task(emit_progress(existing_file_id, {"text": "Using previously uploaded file...", "type": "progress"}))
+        
+        return {"job_id": existing_file_id, "duplicate": True, "original_file_id": file_id}
+    
+    # This is a new file, save it and store metadata
+    logger.info(f"NEW FILE - Storing {file.filename} ({file.size} bytes)")
+    
     # Save upload to disk with a unique prefix so multiple concurrent uploads don't clash.
     file_id = str(uuid.uuid4())
     input_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
 
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    # No need to store metadata - we scan the directory directly for deduplication
 
     # Record mapping for later reuse by /process
     file_store[file_id] = input_path
@@ -668,7 +792,7 @@ async def analyze_video(
     # Send initial progress message to ensure queue is working
     asyncio.create_task(emit_progress(file_id, {"text": "Starting analysis...", "type": "progress"}))
 
-    return {"job_id": file_id}
+    return {"job_id": file_id, "duplicate": False}
 
 # ------------------------------------------------------------
 # Existing /process endpoint below – signature extended to

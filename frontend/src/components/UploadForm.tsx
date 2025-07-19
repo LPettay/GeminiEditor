@@ -12,6 +12,7 @@ import {
   Stepper,
   Step,
   StepLabel,
+  Alert,
 } from '@mui/material';
 import { useMutation } from '@tanstack/react-query';
 import axios from 'axios';
@@ -58,8 +59,22 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
   // UI step: 0=file select, 1=upload/analyze, 2=audio track, 3=scope & submit
   const [activeStep, setActiveStep] = useState(0);
   const [originalName, setOriginalName] = useState<string | null>(null);
+  const [isDuplicate, setIsDuplicate] = useState(false);
+  const [isCheckingDuplicate, setIsCheckingDuplicate] = useState(false);
 
   // Waveform peaks are no longer needed
+
+  const checkDuplicateMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const formData = new FormData();
+      formData.append('filename', file.name);
+      formData.append('size', String(file.size));
+      formData.append('last_modified', String(file.lastModified));
+      
+      const res = await axios.post('/check-duplicate', formData);
+      return res.data as { duplicate: boolean; file_id?: string; message: string };
+    },
+  });
 
   const analyzeMutation = useMutation({
     mutationFn: async (file: File) => {
@@ -78,18 +93,20 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
           }
         },
       });
-      // /analyze now returns { job_id: string }
-      return res.data as { job_id: string };
+      // /analyze now returns { job_id: string, duplicate?: boolean }
+      return res.data as { job_id: string; duplicate?: boolean };
     },
     onMutate: () => {
       setUploadProgress(0);
       setIsProcessing(false);
       setJobId(null);
       setLogLines([]);
+      setIsDuplicate(false);
     },
     onSuccess: (data) => {
       const jid = data.job_id;
       setJobId(jid);
+      setIsDuplicate(data.duplicate || false);
       // isProcessing already true when upload reached 100
     },
     onSettled: () => {
@@ -105,10 +122,53 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     setTracks([]);
     setValue('fileId', undefined as any);
     setValue('audioTrack', undefined);
+    setIsDuplicate(false);
+    setIsCheckingDuplicate(false);
+    
     if (watchedFiles && watchedFiles.length > 0) {
+      const file = watchedFiles[0];
+      setOriginalName(file.name);
       setActiveStep(1);
-      analyzeMutation.mutate(watchedFiles[0]);
-      setOriginalName(watchedFiles[0].name);
+      
+      // First check if this is a duplicate
+      setIsCheckingDuplicate(true);
+      checkDuplicateMutation.mutate(file, {
+        onSuccess: (data) => {
+          setIsCheckingDuplicate(false);
+          if (data.duplicate) {
+            setIsDuplicate(true);
+            // If it's a duplicate, we can skip the upload and go directly to analysis
+            // We'll need to get the existing file_id and start analysis
+            if (data.file_id) {
+              setJobId(data.file_id);
+              // For duplicates, call analyze with just the file_id (no file upload)
+              const fd = new FormData();
+              fd.append('preview_duration', String(20));
+              fd.append('file_id', data.file_id);
+              
+              axios.post('/analyze', fd, {
+                headers: { 'Content-Type': 'multipart/form-data' },
+              }).then((res) => {
+                const responseData = res.data as { job_id: string; duplicate?: boolean };
+                setJobId(responseData.job_id);
+                setIsDuplicate(responseData.duplicate || false);
+                setIsProcessing(true); // Start processing immediately for duplicates
+              }).catch((error) => {
+                console.error('Error starting analysis for duplicate:', error);
+                setLogLines((prev) => [...prev, `Error: ${error.message}`]);
+              });
+            }
+          } else {
+            // Not a duplicate, proceed with normal upload
+            analyzeMutation.mutate(file);
+          }
+        },
+        onError: () => {
+          setIsCheckingDuplicate(false);
+          // If duplicate check fails, proceed with normal upload
+          analyzeMutation.mutate(file);
+        }
+      });
     } else {
       setActiveStep(0);
     }
@@ -202,17 +262,36 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
 
         {activeStep === 1 && (
           <Stack spacing={1} width="100%">
+            {/* Checking for duplicates */}
+            {isCheckingDuplicate && (
+              <>
+                <Typography variant="body2">Checking if file has been uploaded before...</Typography>
+                <LinearProgress variant="indeterminate" />
+              </>
+            )}
+            
+            {/* Duplicate file notification */}
+            {isDuplicate && !isCheckingDuplicate && (
+              <Alert severity="info" sx={{ mb: 2 }}>
+                <Typography variant="body2">
+                  This file has been uploaded before. Using the previously uploaded version to save time and storage.
+                </Typography>
+              </Alert>
+            )}
+            
             {/* Uploading stage */}
-            {uploadProgress !== null && !isProcessing && (
+            {uploadProgress !== null && !isProcessing && !isCheckingDuplicate && (
               <>
                 <Typography variant="body2">Uploading… {uploadProgress}%</Typography>
                 <LinearProgress variant="determinate" value={uploadProgress} />
               </>
             )}
             {/* Server-side processing stage */}
-            {isProcessing && (
+            {isProcessing && !isCheckingDuplicate && (
               <>
-                <Typography variant="body2">Processing audio…</Typography>
+                <Typography variant="body2">
+                  {isDuplicate ? "Processing previously uploaded file…" : "Processing audio…"}
+                </Typography>
                 <LinearProgress variant="indeterminate" />
                 <Box sx={{ pl: 2, pt: 1 }}>
                   {logLines.map((l, i) => (
