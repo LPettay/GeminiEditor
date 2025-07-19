@@ -148,11 +148,11 @@ async def test_video_path(filename: str):
         "files_in_upload_dir": os.listdir(UPLOAD_DIR) if os.path.exists(UPLOAD_DIR) else []
     }
 
-# Custom video serving endpoint with range request support
+# Custom video serving endpoint with optimized range request support
 @app.get("/video/{filename:path}")
 async def serve_video(filename: str, request: Request):
     """
-    Serve video files with proper range request support for seeking.
+    Serve video files with optimized range request support for efficient seeking.
     """
     file_path = os.path.join(UPLOAD_DIR, filename)
     
@@ -182,12 +182,15 @@ async def serve_video(filename: str, request: Request):
     range_header = request.headers.get("range")
     logger.info(f"Range header: {range_header}")
     
+    # Optimized chunk size for video streaming (64KB chunks for better performance)
+    CHUNK_SIZE = 64 * 1024  # 64KB chunks
+    
     if not range_header:
-        # No range request - serve the full file
-        logger.info("Serving full video file")
+        # No range request - serve the full file with optimized streaming
+        logger.info("Serving full video file with optimized streaming")
         def file_generator():
             with open(file_path, "rb") as f:
-                while chunk := f.read(8192):
+                while chunk := f.read(CHUNK_SIZE):
                     yield chunk
         
         return StreamingResponse(
@@ -198,7 +201,9 @@ async def serve_video(filename: str, request: Request):
                 "Accept-Ranges": "bytes",
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, HEAD",
-                "Access-Control-Allow-Headers": "Range"
+                "Access-Control-Allow-Headers": "Range",
+                "Cache-Control": "public, max-age=3600",  # Cache for 1 hour
+                "Content-Disposition": f"inline; filename={filename}"
             }
         )
     
@@ -220,19 +225,27 @@ async def serve_video(filename: str, request: Request):
         
         content_length = end - start + 1
         
+        # Optimize range requests for video seeking
+        # If seeking to a distant position, we can be more aggressive with chunk size
+        if start > file_size * 0.1:  # If seeking past 10% of file
+            # Use larger chunks for faster seeking
+            seek_chunk_size = CHUNK_SIZE * 4  # 256KB for seeking
+        else:
+            seek_chunk_size = CHUNK_SIZE
+        
         def range_generator():
             with open(file_path, "rb") as f:
                 f.seek(start)
                 remaining = content_length
                 while remaining > 0:
-                    chunk_size = min(8192, remaining)
+                    chunk_size = min(seek_chunk_size, remaining)
                     chunk = f.read(chunk_size)
                     if not chunk:
                         break
                     yield chunk
                     remaining -= len(chunk)
         
-        logger.info(f"Serving range: {start}-{end} ({content_length} bytes)")
+        logger.info(f"Serving range: {start}-{end} ({content_length} bytes) with {seek_chunk_size} chunk size")
         return StreamingResponse(
             range_generator(),
             media_type="video/mp4",
@@ -242,7 +255,9 @@ async def serve_video(filename: str, request: Request):
                 "Accept-Ranges": "bytes",
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, HEAD",
-                "Access-Control-Allow-Headers": "Range"
+                "Access-Control-Allow-Headers": "Range",
+                "Cache-Control": "public, max-age=3600",  # Cache for 1 hour
+                "Content-Disposition": f"inline; filename={filename}"
             },
             status_code=206
         )

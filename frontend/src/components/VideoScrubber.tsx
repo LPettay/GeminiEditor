@@ -1,5 +1,5 @@
 import { Box, Slider, Typography, Button, Stack } from '@mui/material';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 
 // Format seconds -> HH:MM:SS
 const fmt = (s: number) => {
@@ -19,11 +19,35 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
   const [range, setRange] = useState<[number, number]>([0, 0]);
   const [currentTime, setCurrentTime] = useState(0);
   const [readyState, setReadyState] = useState(0);
+  const [isSeeking, setIsSeeking] = useState(false);
 
   // Debug the video URL
   useEffect(() => {
     console.log('VideoScrubber: videoUrl =', videoUrl);
   }, [videoUrl]);
+
+  // Optimized seeking function
+  const seekTo = useCallback((time: number) => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(time)) return;
+    
+    // Pause video during seeking to prevent unnecessary buffering
+    const wasPlaying = !video.paused;
+    if (wasPlaying) {
+      video.pause();
+    }
+    
+    setIsSeeking(true);
+    video.currentTime = time;
+    
+    // Resume playback if it was playing before
+    if (wasPlaying) {
+      // Small delay to ensure seeking completes
+      setTimeout(() => {
+        video.play().catch(console.error);
+      }, 100);
+    }
+  }, []);
 
   // Load metadata
   useEffect(() => {
@@ -54,15 +78,18 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
     
     const onSeeking = () => {
       console.log('Seeking to:', v.currentTime);
+      setIsSeeking(true);
     };
     
     const onSeeked = () => {
       console.log('Seeked to:', v.currentTime);
+      setIsSeeking(false);
     };
     
     const onError = (e: Event) => {
       console.error('Video error:', e);
       console.error('Video error details:', v.error);
+      setIsSeeking(false);
     };
     
     v.addEventListener('loadedmetadata', onLoaded);
@@ -82,6 +109,17 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
     };
   }, [videoUrl]);
 
+  // Handle slider change with optimized seeking
+  const handleSliderChange = useCallback((_: Event, value: number | number[]) => {
+    const [start, end] = value as [number, number];
+    setRange([start, end]);
+    
+    // Only seek if the start time changed significantly (more than 5 seconds)
+    if (Math.abs(start - currentTime) > 5) {
+      seekTo(start);
+    }
+  }, [currentTime, seekTo]);
+
   return (
     <Stack spacing={2} width="100%">
       <video 
@@ -89,9 +127,10 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
         ref={videoRef} 
         src={videoUrl} 
         controls 
-        preload="metadata"
         style={{ width: '100%' }}
         crossOrigin="anonymous"
+        // Optimized video attributes for better buffering
+        preload="auto"
         onLoadStart={() => console.log('Video load started')}
         onLoad={() => console.log('Video loaded')}
         onLoadedData={() => console.log('Video loaded data')}
@@ -117,24 +156,32 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
         <Typography variant="caption" display="block">
           Ready State: {readyState} (0=nothing, 1=metadata, 2=current data, 3=future data, 4=enough data)
         </Typography>
+        <Typography variant="caption" display="block">
+          Seeking: {isSeeking ? 'Yes' : 'No'}
+        </Typography>
       </Box>
       
       {duration > 0 && (
         <>
           <Slider
             value={range}
-            onChange={(_, val) => setRange(val as [number, number])}
+            onChange={handleSliderChange}
             min={0}
             max={duration}
             step={0.1}
             valueLabelDisplay="auto"
             valueLabelFormat={(value) => fmt(value as number)}
+            disabled={isSeeking}
           />
           <Box display="flex" justifyContent="space-between">
             <Typography variant="body2">In {fmt(range[0])}</Typography>
             <Typography variant="body2">Out {fmt(range[1])}</Typography>
           </Box>
-          <Button variant="contained" onClick={() => onConfirm(range[0], range[1])}>
+          <Button 
+            variant="contained" 
+            onClick={() => onConfirm(range[0], range[1])}
+            disabled={isSeeking}
+          >
             Use These Points
           </Button>
         </>
