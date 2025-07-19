@@ -106,7 +106,12 @@ def cut_and_concatenate(file_path, segments, output_path, audio_track=0):
         logger.info(f"Video concatenation complete. Output: {output_path}")
         return output_path
     finally:
-        shutil.rmtree(temp_dir)
+        # Always clean up the temporary directory
+        try:
+            shutil.rmtree(temp_dir)
+            logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e}")
 
 def extract_audio_segment(input_video_path: str, start_time: float, end_time: float, output_audio_path: str, audio_track_index: int = 0) -> bool:
     """
