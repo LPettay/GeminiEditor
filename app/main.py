@@ -363,40 +363,7 @@ def find_existing_file_by_metadata(filename: str, size: int, last_modified: int)
     Returns tuple of (file_id, file_path) if found, None otherwise.
     Uses only filename and size for deduplication.
     """
-    if not os.path.exists(UPLOAD_DIR):
-        return None
-    
-    # Scan all files in uploads directory
-    for file_path in os.listdir(UPLOAD_DIR):
-        full_path = os.path.join(UPLOAD_DIR, file_path)
-        if not os.path.isfile(full_path):
-            continue
-        
-        # Extract original filename from UUID-prefixed filename
-        # Format: {file_id}_{original_filename}
-        if '_' not in file_path:
-            continue
-        
-        try:
-            # Split on first underscore to separate UUID from original filename
-            parts = file_path.split('_', 1)
-            if len(parts) != 2:
-                continue
-            
-            file_id, original_filename = parts
-            
-            # Check if this file matches our criteria
-            if original_filename == filename:
-                # Get file size
-                file_size = os.path.getsize(full_path)
-                if file_size == size:
-                    logger.info(f"Found duplicate: {file_path} (size: {file_size})")
-                    return (file_id, full_path)
-        except (OSError, ValueError) as e:
-            logger.warning(f"Error checking file {file_path}: {e}")
-            continue
-    
-    return None
+    return find_file_by_name_and_size(filename, size)
 
 @app.post("/check-duplicate")
 async def check_duplicate(
@@ -425,7 +392,66 @@ async def check_duplicate(
         }
 
 # In-memory mapping of file_id → absolute video file path created by /analyze.
-file_store: Dict[str, str] = {}
+# Rebuilt on startup by scanning uploads directory
+
+def rebuild_file_store() -> Dict[str, str]:
+    """Rebuild file store by scanning uploads directory and matching UUIDs to filenames"""
+    file_store = {}
+    
+    try:
+        if not os.path.exists(UPLOAD_DIR):
+            logger.info(f"Uploads directory {UPLOAD_DIR} does not exist, starting with empty file store")
+            return file_store
+            
+        # Pattern: {uuid}_{filename} (e.g., "10ecdbf7-54b1-4ec7-9a32-f11cd570727f_p2.mkv")
+        uuid_pattern = re.compile(r'^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})_(.+)$')
+        
+        for filename in os.listdir(UPLOAD_DIR):
+            match = uuid_pattern.match(filename)
+            if match:
+                file_id = match.group(1)
+                original_filename = match.group(2)
+                file_path = os.path.join(UPLOAD_DIR, filename)
+                
+                if os.path.isfile(file_path):
+                    file_store[file_id] = file_path
+                    logger.debug(f"Found file mapping: {file_id} -> {file_path}")
+        
+        logger.info(f"Rebuilt file store with {len(file_store)} entries from uploads directory")
+        return file_store
+        
+    except Exception as e:
+        logger.error(f"Error rebuilding file store: {e}")
+        return {}
+
+def find_file_by_name_and_size(filename: str, size: int) -> Optional[tuple[str, str]]:
+    """Find existing file by matching filename and size"""
+    try:
+        uuid_pattern = re.compile(r'^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})_(.+)$')
+        
+        for stored_filename in os.listdir(UPLOAD_DIR):
+            match = uuid_pattern.match(stored_filename)
+            if match:
+                file_id = match.group(1)
+                original_filename = match.group(2)
+                
+                # Check if filename matches
+                if original_filename == filename:
+                    file_path = os.path.join(UPLOAD_DIR, stored_filename)
+                    
+                    # Check if file exists and size matches
+                    if os.path.isfile(file_path) and os.path.getsize(file_path) == size:
+                        logger.info(f"Found duplicate: {file_id} (size: {size})")
+                        return file_id, file_path
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error finding file by name and size: {e}")
+        return None
+
+# Load the file store by scanning directory
+file_store: Dict[str, str] = rebuild_file_store()
 
 # Path to audiowaveform binary – prefer project-local tools copy
 _local_audiowf = os.path.join(_project_root, "tools", "audiowaveform.exe")
@@ -980,7 +1006,9 @@ async def process_video(
             logger.info(f"Processing video with AppConfig: {app_config.model_dump_json(indent=2)}")
             # --- End Construct AppConfig ---
 
-            logger.info(f"Starting processing for file: {file.filename}")
+            # Get the filename for logging - handle both file upload and file_id cases
+            filename_for_logging = file.filename if file is not None else f"file_id_{file_id}"
+            logger.info(f"Starting processing for file: {filename_for_logging}")
             run_timestamp = time.strftime("%Y%m%d_%H%M%S")
             
             # Resolve the video source – either freshly uploaded or referenced by *file_id*
@@ -1018,7 +1046,7 @@ async def process_video(
                 trimmed_path = os.path.join(UPLOAD_DIR, trimmed_name)
 
                 if not os.path.exists(trimmed_path):
-                    logger.info(f"Trimming input video to scope {scope_start_seconds:.2f}s – {scope_end_seconds:.2f}s → {trimmed_path}")
+                    logger.info(f"Trimming input video to scope {scope_start_seconds:.2f}s - {scope_end_seconds:.2f}s -> {trimmed_path}")
                     ff_cmd = [
                         "ffmpeg", "-nostdin", "-y",
                         "-ss", str(scope_start_seconds),
@@ -1067,7 +1095,7 @@ async def process_video(
                     transcript_data = None
             
             if transcript_data is None:
-                logger.info(f"No reusable transcript found or loading failed. Starting fresh transcription for {file.filename}...")
+                logger.info(f"No reusable transcript found or loading failed. Starting fresh transcription for {filename_for_logging}...")
                 if app_config.transcription_config.save_speech_audio and predictable_speech_audio_path: # Use AppConfig
                      logger.info(f"Speech-only audio will be saved to: {predictable_speech_audio_path}")
                 try:
@@ -1082,7 +1110,7 @@ async def process_video(
                         save_speech_audio_path=predictable_speech_audio_path # Remains conditional
                     )
                     logger.info(f"Transcription complete. Got {len(transcript_data['segments'])} segments.")
-                    transcript_source_message = f"Newly generated transcript for {file.filename}"
+                    transcript_source_message = f"Newly generated transcript for {filename_for_logging}"
                     with open(predictable_transcript_path, "w", encoding="utf-8") as f:
                         json.dump(transcript_data, f, ensure_ascii=False, indent=2)
                     logger.info(f"New transcript saved for reuse to: {predictable_transcript_path}")
@@ -1681,7 +1709,9 @@ async def process_video(
                 logger.info("--- Starting Intermediate Step 5: Final Video Assembly from Pass 2 EDL ---")
                 final_multimodal_video_path = None
                 if final_pass2_edl: # Only attempt if EDL for ffmpeg has segments
-                    final_multimodal_video_path = os.path.join(PROCESSED_DIR, f"{base_name}_final_multimodal_{run_timestamp}{os.path.splitext(file.filename)[1]}")
+                    # Get the file extension from the input path instead of file.filename
+                    input_file_ext = os.path.splitext(input_path)[1]
+                    final_multimodal_video_path = os.path.join(PROCESSED_DIR, f"{base_name}_final_multimodal_{run_timestamp}{input_file_ext}")
                     try:
                         logger.info(f"Assembling final video from {len(final_pass2_edl)} segments using candidate video '{candidate_video_path}' as source.")
                         await asyncio.to_thread(
@@ -1712,7 +1742,7 @@ async def process_video(
                      processing_message = "Multimodal pipeline completed, but final video assembly failed."
 
 
-                logger.info(f"New multimodal pipeline processing finished for {file.filename}.")
+                logger.info(f"New multimodal pipeline processing finished for {filename_for_logging}.")
                 response_payload = {
                     "message": processing_message,
                     "input_file": input_path,
@@ -1735,7 +1765,7 @@ async def process_video(
                 return JSONResponse(response_payload)
 
         except Exception as e:
-            logger.error(f"Critical error during processing of {file.filename}: {str(e)}", exc_info=True)
+            logger.error(f"Critical error during processing of {filename_for_logging}: {str(e)}", exc_info=True)
             # Clean up temporary resources even on error
             cleanup_temp_resources()
             return JSONResponse(status_code=500, content={"message": f"Error processing file: {str(e)}"})
@@ -1765,6 +1795,33 @@ async def startup_event():
     """Startup event to initialize periodic cleanup"""
     asyncio.create_task(periodic_cleanup())
     logger.info("Started periodic cleanup task")
+    
+    # Log file store status
+    logger.info(f"File store contains {len(file_store)} entries")
+    for file_id, file_path in file_store.items():
+        exists = os.path.exists(file_path)
+        size = os.path.getsize(file_path) if exists else 0
+        logger.info(f"  {file_id}: {file_path} (exists: {exists}, size: {size} bytes)")
+
+@app.get("/debug/file-store")
+async def debug_file_store():
+    """Debug endpoint to check file store status"""
+    file_info = []
+    for file_id, file_path in file_store.items():
+        exists = os.path.exists(file_path)
+        size = os.path.getsize(file_path) if exists else 0
+        file_info.append({
+            "file_id": file_id,
+            "file_path": file_path,
+            "exists": exists,
+            "size": size
+        })
+    
+    return {
+        "total_entries": len(file_store),
+        "uploads_directory": UPLOAD_DIR,
+        "files": file_info
+    }
 
 @app.on_event("shutdown")
 async def shutdown_event():

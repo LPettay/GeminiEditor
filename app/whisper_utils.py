@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import contextlib
 import torch
+import json
 from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -267,6 +268,26 @@ def transcribe_video(video_path, model_name="base", language="en", audio_track=0
 
     try:
         # 1. Extract full audio from video
+        # First, check what audio tracks are available
+        probe_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_streams', '-print_format', 'json', video_path]
+        try:
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            audio_streams = json.loads(probe_result.stdout).get('streams', [])
+            num_audio_tracks = len(audio_streams)
+            
+            logger.info(f"Found {num_audio_tracks} audio tracks in {video_path}")
+            for i, stream in enumerate(audio_streams):
+                logger.info(f"  Track {i}: {stream.get('codec_name', 'unknown')} - {stream.get('tags', {}).get('language', 'unknown language')}")
+            
+            # Validate audio track selection
+            if audio_track >= num_audio_tracks:
+                logger.warning(f"Requested audio track {audio_track} but only {num_audio_tracks} tracks available. Using track 0.")
+                audio_track = 0
+            
+        except Exception as e:
+            logger.warning(f"Could not probe audio tracks: {e}. Using requested track {audio_track}.")
+            num_audio_tracks = 1  # Assume at least one track exists
+        
         logger.info(f"Extracting audio track {audio_track} from {video_path} to {temp_audio_path}")
         cmd_extract = [
             'ffmpeg', '-i', video_path,
