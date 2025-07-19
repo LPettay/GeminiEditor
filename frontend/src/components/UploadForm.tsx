@@ -229,7 +229,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
       }}
     >
       <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 3, width: '100%' }}>
-        {['Select file', 'Analyzing', 'Pick audio', 'Scope & submit'].map((label) => (
+        {['Select file', 'Analyzing', 'Pick audio', 'Submit'].map((label) => (
           <Step key={label}>
             <StepLabel>{label}</StepLabel>
           </Step>
@@ -359,7 +359,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
           <>
             <VideoScrubber
               videoUrl={`/video/${jobId}_${encodeURIComponent(originalName)}`}
-              onConfirm={(inn, out) => {
+              onRangeChange={(inn, out) => {
                 setValue('scopeStart', inn);
                 setValue('scopeEnd', out);
               }}

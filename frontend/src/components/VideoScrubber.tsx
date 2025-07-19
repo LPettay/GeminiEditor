@@ -1,4 +1,4 @@
-import { Box, Slider, Typography, Button, Stack } from '@mui/material';
+import { Box, Slider, Typography, Stack } from '@mui/material';
 import { useEffect, useRef, useState, useCallback } from 'react';
 
 // Format seconds -> HH:MM:SS
@@ -10,10 +10,10 @@ const fmt = (s: number) => {
 
 interface Props {
   videoUrl: string;
-  onConfirm: (start: number, end: number) => void;
+  onRangeChange: (start: number, end: number) => void;
 }
 
-const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
+const VideoScrubber: React.FC<Props> = ({ videoUrl, onRangeChange }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [duration, setDuration] = useState(0);
   const [range, setRange] = useState<[number, number]>([0, 0]);
@@ -65,6 +65,7 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
       });
       setDuration(v.duration);
       setRange([0, v.duration]);
+      onRangeChange(0, v.duration);
     };
     
     const onCanPlay = () => {
@@ -107,18 +108,19 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
       v.removeEventListener('seeked', onSeeked);
       v.removeEventListener('error', onError);
     };
-  }, [videoUrl]);
+  }, [videoUrl, onRangeChange]);
 
   // Handle slider change with optimized seeking
   const handleSliderChange = useCallback((_: Event, value: number | number[]) => {
     const [start, end] = value as [number, number];
     setRange([start, end]);
+    onRangeChange(start, end);
     
     // Only seek if the start time changed significantly (more than 5 seconds)
     if (Math.abs(start - currentTime) > 5) {
       seekTo(start);
     }
-  }, [currentTime, seekTo]);
+  }, [currentTime, seekTo, onRangeChange]);
 
   return (
     <Stack spacing={2} width="100%">
@@ -177,13 +179,6 @@ const VideoScrubber: React.FC<Props> = ({ videoUrl, onConfirm }) => {
             <Typography variant="body2">In {fmt(range[0])}</Typography>
             <Typography variant="body2">Out {fmt(range[1])}</Typography>
           </Box>
-          <Button 
-            variant="contained" 
-            onClick={() => onConfirm(range[0], range[1])}
-            disabled={isSeeking}
-          >
-            Use These Points
-          </Button>
         </>
       )}
     </Stack>
