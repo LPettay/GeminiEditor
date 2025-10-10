@@ -30,6 +30,9 @@ transcript_jobs = {}
 # Store for video segmentation jobs
 segmentation_jobs = {}
 
+# Store for video clips metadata (in production, this would be in the database)
+video_clips_store = {}
+
 
 @router.post("/api/projects/{project_id}/source-videos/{video_id}/process")
 async def process_video(
@@ -610,6 +613,19 @@ async def _segment_video_background(job_id: str, video_id: str, video_path: str,
         
         if result.success:
             logger.info(f"Segmentation completed successfully with {len(result.clips)} clips")
+            
+            # Store clip metadata for streaming
+            for clip in result.clips:
+                video_clips_store[clip.id] = {
+                    "source_video_id": video_id,
+                    "project_id": project_id,
+                    "start_time": clip.start_time,
+                    "end_time": clip.end_time,
+                    "duration": clip.duration,
+                    "segment_id": clip.segment_id,
+                    "file_path": clip.file_path
+                }
+            
             # Update job status with success
             segmentation_jobs[job_id] = {
                 "status": "completed",
@@ -626,7 +642,7 @@ async def _segment_video_background(job_id: str, video_id: str, video_path: str,
                         "end_time": clip.end_time,
                         "duration": clip.duration,
                         "order_index": clip.order_index,
-                        "stream_url": f"/api/projects/{project_id}/clips/{clip.id}/play"  # Simplified URL generation
+                        "stream_url": f"/api/projects/{project_id}/clips/{clip.id}/play"
                     }
                     for clip in result.clips
                 ]
@@ -678,17 +694,59 @@ async def get_segmentation_status(
 
 
 @router.get("/api/projects/{project_id}/clips/{clip_id}/play")
-def stream_clip(project_id: str, clip_id: str, request: Request):
+def stream_clip(project_id: str, clip_id: str, request: Request, db: Session = Depends(get_db)):
     """Stream a video clip file."""
     from app.services.video_streaming import stream_video_file
     
-    # For now, we need to find the clip file path
-    # TODO: Implement proper clip storage and retrieval
-    # This is a placeholder - in a real implementation, you'd store clip metadata in the database
-    
-    # For now, return an error
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Clip streaming not yet implemented"
-    )
+    try:
+        # Get clip metadata from store
+        if clip_id not in video_clips_store:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Clip {clip_id} not found"
+            )
+        
+        clip_metadata = video_clips_store[clip_id]
+        
+        # Verify the clip belongs to this project
+        if clip_metadata["project_id"] != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Clip does not belong to this project"
+            )
+        
+        # Get the source video
+        source_video = SourceVideoDAO.get_by_id(db, clip_metadata["source_video_id"])
+        if not source_video:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Source video not found"
+            )
+        
+        # Check if clip file exists (if we're using actual clip files)
+        if os.path.exists(clip_metadata["file_path"]):
+            # Stream the actual clip file
+            return stream_video_file(
+                clip_metadata["file_path"],
+                f"clip_{clip_id}.mp4",
+                request
+            )
+        else:
+            # For now, stream the full original video
+            # The frontend LivePreviewPlayer will handle time-based seeking
+            # This is simpler and more performant than server-side time range streaming
+            return stream_video_file(
+                source_video.file_path,
+                source_video.filename,
+                request
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error streaming clip {clip_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to stream clip: {str(e)}"
+        )
 

@@ -23,6 +23,17 @@ import {
 import { VideoPlayer } from '../common/VideoPlayer';
 import { TranscriptDisplay } from '../common/TranscriptDisplay';
 import { ReorderableTranscript } from './ReorderableTranscript';
+import { LivePreviewPlayer } from './LivePreviewPlayer';
+
+interface VideoClip {
+  id: string;
+  segment_id: string;
+  start_time: number;
+  end_time: number;
+  duration: number;
+  order_index: number;
+  stream_url: string;
+}
 import { TranscriptSegment, TranscriptSyncService, SyncState } from '../../services/transcriptSyncService';
 import { apiClient } from '../../api/client';
 
@@ -78,6 +89,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   const [isSegmentingVideo, setIsSegmentingVideo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [editingMode, setEditingMode] = useState<'view' | 'edit'>('view');
+  const [currentClipIndex, setCurrentClipIndex] = useState(0);
   
   const videoPlayerRef = useRef<any>(null);
   const syncServiceRef = useRef<TranscriptSyncService>(new TranscriptSyncService());
@@ -369,6 +381,24 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     syncServiceRef.current.startSync(videoElement);
   };
 
+  // Live Preview Player handlers
+  const handleClipChange = useCallback((clipIndex: number) => {
+    setCurrentClipIndex(clipIndex);
+  }, []);
+
+  const handleTimeUpdate = useCallback((absoluteTime: number, clipIndex: number) => {
+    // Update sync state based on the current time in the reordered sequence
+    // This is where we'll sync with the reordered transcript
+    console.log(`Time update: ${absoluteTime}s in clip ${clipIndex}`);
+    
+    // TODO: Implement transcript sync with reordered segments
+    // For now, just update the basic sync state
+    setSyncState(prev => ({
+      ...prev,
+      currentTime: absoluteTime,
+    }));
+  }, []);
+
   const handleSegmentClick = (segment: TranscriptSegment) => {
     if (videoPlayerRef.current) {
       videoPlayerRef.current.seek(segment.start);
@@ -408,8 +438,22 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
 
   const handleSegmentsReorder = (reorderedSegments: TranscriptSegment[]) => {
     setReorderedSegments(reorderedSegments);
-    // TODO: Update video playback to reflect new order
-    console.log('Segments reordered:', reorderedSegments.map(s => s.text));
+    
+    // Update video clips to reflect the new order
+    const reorderedClips = reorderedSegments
+      .map(segment => {
+        // Find the corresponding video clip for this segment
+        const originalClip = videoClips.find(clip => clip.segment_id === segment.id);
+        return originalClip;
+      })
+      .filter((clip): clip is VideoClip => clip !== undefined)
+      .map((clip, index) => ({
+        ...clip,
+        order_index: index, // Update the order index
+      }));
+    
+    setVideoClips(reorderedClips);
+    console.log('Segments reordered, updated video clips:', reorderedClips.length);
   };
 
   const handleSegmentVideo = (segment: TranscriptSegment) => {
@@ -493,13 +537,23 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
         <Box sx={{ flex: { xs: 1, lg: 2 }, minHeight: { xs: '300px', lg: 'auto' }, display: 'flex', flexDirection: 'column' }}>
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <VideoPlayer
-                ref={videoPlayerRef}
-                src={videoUrl}
-                title={videoTitle}
-                onVideoReady={handleVideoReady}
-                style={{ flex: 1, minHeight: 0 }}
-              />
+              {editingMode === 'edit' && videoClips.length > 0 ? (
+                <LivePreviewPlayer
+                  clips={videoClips}
+                  currentClipIndex={currentClipIndex}
+                  onClipChange={handleClipChange}
+                  onTimeUpdate={handleTimeUpdate}
+                  style={{ flex: 1, minHeight: 0 }}
+                />
+              ) : (
+                <VideoPlayer
+                  ref={videoPlayerRef}
+                  src={videoUrl}
+                  title={videoTitle}
+                  onVideoReady={handleVideoReady}
+                  style={{ flex: 1, minHeight: 0 }}
+                />
+              )}
             </Box>
           </Paper>
         </Box>

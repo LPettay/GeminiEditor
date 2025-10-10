@@ -39,6 +39,8 @@ class VideoStreamingService:
         file_path: str,
         filename: str,
         request: Request,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
         semaphore: Optional[object] = None
     ) -> StreamingResponse:
         """
@@ -176,9 +178,16 @@ class VideoStreamingService:
 
 
 # Convenience function for easy integration
-def stream_video_file(file_path: str, filename: str, request: Request) -> StreamingResponse:
+def stream_video_file(file_path: str, filename: str, request: Request, start_time: Optional[float] = None, end_time: Optional[float] = None) -> StreamingResponse:
     """
     Convenience function to stream a video file.
     This is the main entry point for video streaming.
+    
+    Args:
+        file_path: Path to the video file
+        filename: Display name for the file
+        request: FastAPI request object
+        start_time: Optional start time in seconds for clip streaming
+        end_time: Optional end time in seconds for clip streaming
     """
-    return VideoStreamingService.stream_video_file(file_path, filename, request)
+    return VideoStreamingService.stream_video_file(file_path, filename, request, start_time, end_time)

@@ -65,7 +65,9 @@ export const ReorderableTranscript: React.FC<ReorderableTranscriptProps> = ({
     }))
   );
   const [scrollOffset, setScrollOffset] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const autoScrollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Track scroll position for drag alignment
   useEffect(() => {
@@ -82,6 +84,9 @@ export const ReorderableTranscript: React.FC<ReorderableTranscriptProps> = ({
     container.addEventListener('scroll', handleScroll, { passive: true });
     return () => container.removeEventListener('scroll', handleScroll);
   }, []);
+
+  // Simple scroll tracking - let the library handle positioning
+  // The ignoreContainerClipping prop should help with scroll issues
 
   const formatTime = (time: number): string => {
     const minutes = Math.floor(time / 60);
@@ -137,7 +142,13 @@ export const ReorderableTranscript: React.FC<ReorderableTranscriptProps> = ({
     };
   };
 
+  const handleDragStart = () => {
+    setIsDragging(true);
+  };
+
   const handleDragEnd = (result: DropResult) => {
+    setIsDragging(false);
+    
     if (!result.destination) return;
 
     const newSegments = Array.from(segmentsWithOrder);
@@ -211,8 +222,23 @@ export const ReorderableTranscript: React.FC<ReorderableTranscriptProps> = ({
       
       <Box ref={containerRef} sx={{ flex: 1, overflow: 'auto', px: 2, pb: 2 }}>
 
-      <DragDropContext onDragEnd={handleDragEnd}>
-        <Droppable droppableId="transcript-segments">
+      <DragDropContext 
+        onDragStart={handleDragStart} 
+        onDragEnd={handleDragEnd}
+        onBeforeCapture={() => {
+          // Ensure the container is ready for drag operations
+          if (containerRef.current) {
+            containerRef.current.style.position = 'relative';
+          }
+        }}
+      >
+        <Droppable 
+          droppableId="transcript-segments"
+          type="SEGMENT"
+          isDropDisabled={false}
+          direction="vertical"
+          ignoreContainerClipping={true}
+        >
           {(provided, snapshot) => (
             <Box
               {...provided.droppableProps}
