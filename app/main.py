@@ -178,7 +178,13 @@ app = FastAPI()
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",  # Common React dev port
+        "http://192.168.1.106:5173",  # Your specific local network IP
+    ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1|192\.168\.1\.\d+):(5173|3000|4173|8080)",  # Allow common dev ports
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -416,7 +416,25 @@ class ApiClient {
 
 }
 
+// Get API base URL from environment or construct it dynamically
+const getApiBaseUrl = (): string => {
+  // Check if we have a custom API URL in environment
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
+  }
+  
+  // If we're on localhost/127.0.0.1, use localhost:8000
+  const hostname = window.location.hostname;
+  if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    return 'http://localhost:8000';
+  }
+  
+  // For network access, use the same hostname but port 8000
+  const protocol = window.location.protocol;
+  return `${protocol}//${hostname}:8000`;
+};
+
 // Export singleton instance
-export const apiClient = new ApiClient();
+export const apiClient = new ApiClient(getApiBaseUrl());
 export default apiClient;
 
