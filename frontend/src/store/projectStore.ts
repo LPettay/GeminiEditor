@@ -3,7 +3,7 @@
  */
 
 import { create } from 'zustand';
-import { Project, SourceVideo, Edit } from '../api/client';
+import { type Project, type SourceVideo, type Edit } from '../api/client';
 
 interface ProjectStore {
   // Current state

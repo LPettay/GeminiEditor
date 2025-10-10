@@ -46,9 +46,14 @@ export const LivePreviewPlayer: React.FC<LivePreviewPlayerProps> = ({
   className,
   style,
 }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const primaryVideoRef = useRef<HTMLVideoElement>(null);
+  // Legacy refs/states no longer used with HLS-based player
   const isPlayingRef = useRef(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const currentTimeRef = useRef(0);
+  const lastUpdateTimeRef = useRef(0);
+  const seekTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isTransitioningRef = useRef(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -71,114 +76,167 @@ export const LivePreviewPlayer: React.FC<LivePreviewPlayerProps> = ({
     return absoluteTime + currentTime;
   };
 
-  // Load the current clip
+  // Load current clip - Single video approach
   useEffect(() => {
-    if (!currentClip || !videoRef.current) return;
+    if (!currentClip) return;
 
-    console.log('Loading clip:', currentClipIndex, 'URL:', currentClip.stream_url);
-    const wasPlaying = isPlayingRef.current;
-    console.log('Loading new clip, wasPlaying:', wasPlaying);
-    
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo) return;
+
+    console.log('LOADING EFFECT: currentClipIndex=', currentClipIndex);
+    console.log('  → Current video src:', primaryVideo.src);
+    console.log('  → Target clip src:', currentClip.stream_url);
+
+    // Compare URLs - video.src is absolute, clip URL might be relative
+    const videoPath = primaryVideo.src ? new URL(primaryVideo.src).pathname : '';
+    const clipPath = currentClip.stream_url.startsWith('http')
+      ? new URL(currentClip.stream_url).pathname
+      : currentClip.stream_url;
+    const urlsMatch = videoPath === clipPath;
+
+    console.log('  → URLs match:', urlsMatch, 'readyState:', primaryVideo.readyState);
+
+    // If video already has the correct clip loaded and ready, don't reload
+    if (urlsMatch && primaryVideo.readyState >= 2) {
+      console.log('  → SKIP: Video already has correct clip loaded');
+      setIsLoading(false);
+      return;
+    }
+
+    console.log('  → LOADING clip into video');
     setIsLoading(true);
     setError(null);
-    
-    // Load the video clip (this will be the full original video)
-    videoRef.current.src = currentClip.stream_url;
-    
-    // Only call load() if we're not trying to maintain playing state
-    if (!wasPlaying) {
-      videoRef.current.load();
-    } else {
-      // If we want to maintain playing state, just set the src and let it load naturally
-      console.log('Skipping load() to maintain playing state');
-      
-      // But we still need to call play() after the video loads
-      const handleCanPlay = () => {
-        console.log('New clip can play, starting autoplay');
-        if (videoRef.current && wasPlaying) {
-          videoRef.current.play()
-            .then(() => {
-              console.log('Autoplay after src change successful');
-            })
-            .catch((error) => {
-              console.error('Autoplay after src change failed:', error);
-            });
-        }
-        videoRef.current?.removeEventListener('canplay', handleCanPlay);
-      };
-      
-      videoRef.current.addEventListener('canplay', handleCanPlay);
-    }
-    
+
+    // Load current clip
+    primaryVideo.src = currentClip.stream_url;
+    primaryVideo.load();
+
+    // Set currentTime when loaded
+    const handleLoadedData = () => {
+      if (primaryVideo.readyState >= 2) {
+        primaryVideo.currentTime = 0;
+        setIsLoading(false);
+        console.log('  → Video loaded and seeked to 0.0');
+      }
+    };
+    primaryVideo.addEventListener('loadeddata', handleLoadedData, { once: true });
+
     // Reset time when switching clips
+    currentTimeRef.current = 0;
     setCurrentTime(0);
-    
+
+    return () => {
+      primaryVideo.removeEventListener('loadeddata', handleLoadedData);
+    };
+
   }, [currentClip, currentClipIndex]);
 
   // Handle video events
   const handleLoadedMetadata = useCallback(() => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration);
+    const primaryVideo = primaryVideoRef.current;
+    if (primaryVideo) {
+      setDuration(primaryVideo.duration);
       setIsLoading(false);
     }
   }, []);
 
-  const handleTimeUpdate = useCallback(() => {
-    if (videoRef.current && currentClip) {
-      const videoTime = videoRef.current.currentTime;
-      
-      // Check if we've reached the end of the current clip
-      if (videoTime >= currentClip.end_time) {
-        // Auto-advance to next clip
-        if (currentClipIndex < clips.length - 1) {
-          onClipChange(currentClipIndex + 1);
-        } else {
-          // End of all clips
-          setIsPlaying(false);
-          setCurrentTime(0);
-          onClipChange(0); // Reset to first clip
+  // Function to advance to next clip - Single video approach
+  const advanceToNextClip = useCallback(() => {
+    // Prevent double transitions
+    if (isTransitioningRef.current) {
+      console.log('BLOCKED - already transitioning');
+      return;
+    }
+
+    console.log('ADVANCING from clip', currentClipIndex, 'to', currentClipIndex + 1);
+
+    if (currentClipIndex < sortedClips.length - 1) {
+      const wasPlaying = isPlayingRef.current;
+      isTransitioningRef.current = true;
+
+      const primaryVideo = primaryVideoRef.current;
+      const nextClip = sortedClips[currentClipIndex + 1];
+
+      if (primaryVideo && nextClip) {
+        // Pause current playback
+        primaryVideo.pause();
+
+        // Load next clip
+        console.log('Loading next clip:', nextClip.stream_url);
+        primaryVideo.src = nextClip.stream_url;
+        primaryVideo.currentTime = 0;
+        primaryVideo.load();
+
+        // Update clip index
+        onClipChange(currentClipIndex + 1);
+
+        // Reset time
+        currentTimeRef.current = 0;
+        setCurrentTime(0);
+
+        // Maintain playing state - play() will be called by useEffect
+        if (wasPlaying) {
+          setIsPlaying(true);
+          isPlayingRef.current = true;
         }
+      }
+
+      // Clear transition flag
+      setTimeout(() => {
+        isTransitioningRef.current = false;
+      }, 100);
+    } else {
+      // End of all clips
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+      currentTimeRef.current = 0;
+      setCurrentTime(0);
+      onClipChange(0);
+      isTransitioningRef.current = false;
+    }
+  }, [currentClipIndex, sortedClips, onClipChange]);
+
+  const handleTimeUpdate = useCallback(() => {
+    const primaryVideo = primaryVideoRef.current;
+    if (primaryVideo && currentClip) {
+      const videoTime = primaryVideo.currentTime;
+
+      // Check if we've reached the end of the current clip file
+      if (videoTime >= currentClip.duration) {
+        // Don't process if we're already transitioning
+        if (isTransitioningRef.current) {
+          return;
+        }
+
+        console.log('END REACHED clip', currentClipIndex, 'time:', videoTime, 'duration:', currentClip.duration);
+        // Pause the video to prevent it from continuing
+        primaryVideo.pause();
+        // Advance to next clip
+        advanceToNextClip();
         return;
       }
-      
-      // Calculate time within the current clip
-      const clipTime = Math.max(0, videoTime - currentClip.start_time);
-      setCurrentTime(clipTime);
-      
+
+      // Calculate time within the current clip (same as videoTime since clips start at 0)
+      const clipTime = Math.max(0, videoTime);
+
+      // Throttle updates to prevent infinite loops (only update every 500ms)
+      const now = Date.now();
+      if (now - lastUpdateTimeRef.current >= 500 && Math.abs(currentTimeRef.current - clipTime) >= 0.5) {
+        currentTimeRef.current = clipTime;
+        setCurrentTime(clipTime);
+        lastUpdateTimeRef.current = now;
+      }
+
       // Calculate absolute time across all clips
       let absoluteTime = 0;
       for (let i = 0; i < currentClipIndex; i++) {
         absoluteTime += clips[i].duration;
       }
       absoluteTime += clipTime;
-      
+
       onTimeUpdate(absoluteTime, currentClipIndex);
     }
-  }, [currentClipIndex, clips, currentClip, onTimeUpdate]);
-
-  const handleEnded = useCallback(() => {
-    // Auto-advance to next clip
-    if (currentClipIndex < sortedClips.length - 1) {
-      console.log('Clip ended, moving to clip:', currentClipIndex + 1);
-      const wasPlaying = isPlayingRef.current;
-      console.log('Was playing before clip change:', wasPlaying);
-      
-      onClipChange(currentClipIndex + 1);
-      
-      // If it was playing, the new clip should start playing automatically
-      // since we're not calling load() which would pause it
-      if (wasPlaying) {
-        console.log('Should autoplay since we skipped load()');
-      }
-    } else {
-      // End of all clips
-      console.log('All clips finished, stopping playback');
-      setIsPlaying(false);
-      isPlayingRef.current = false;
-      setCurrentTime(0);
-      onClipChange(0); // Reset to first clip
-    }
-  }, [currentClipIndex, sortedClips.length, onClipChange]);
+  }, [currentClipIndex, clips, currentClip, onTimeUpdate, advanceToNextClip]);
 
   const handleError = useCallback((e: React.SyntheticEvent<HTMLVideoElement, Event>) => {
     console.error('Video error:', e);
@@ -188,100 +246,172 @@ export const LivePreviewPlayer: React.FC<LivePreviewPlayerProps> = ({
 
   // Playback controls
   const handlePlayPause = async () => {
-    if (!videoRef.current) return;
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo) return;
 
     try {
       if (isPlaying) {
-        console.log('Manual pause triggered');
-        videoRef.current.pause();
+        primaryVideo.pause();
+        setIsPlaying(false);
         isPlayingRef.current = false;
       } else {
-        console.log('Manual play triggered');
-        await videoRef.current.play();
+        setIsPlaying(true);
         isPlayingRef.current = true;
+        // The useEffect will handle the actual playing
       }
-    } catch (error) {
-      console.error('Playback error:', error);
-      setError('Playback failed');
+    } catch (err: unknown) {
+      const e = err as { name?: string };
+      // Don't log AbortError as it's expected during transitions
+      if (e?.name !== 'AbortError') {
+        console.error('Playback error:', err);
+        setError('Playback failed');
+      }
     }
   };
 
   const handleSeek = (event: Event, newValue: number | number[]) => {
-    if (!videoRef.current || !currentClip) return;
-    
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo || !currentClip) return;
+
+    // Clear any existing seek timeout to debounce rapid seeking
+    if (seekTimeoutRef.current) {
+      clearTimeout(seekTimeoutRef.current);
+    }
+
     const absoluteTime = newValue as number;
-    
-    // Find which clip this time corresponds to
-    let accumulatedTime = 0;
-    let targetClipIndex = 0;
-    let clipTime = 0;
-    
-    for (let i = 0; i < sortedClips.length; i++) {
-      if (absoluteTime <= accumulatedTime + sortedClips[i].duration) {
-        targetClipIndex = i;
-        clipTime = absoluteTime - accumulatedTime;
-        break;
+
+    // Debounce seek operations to prevent rapid requests
+    seekTimeoutRef.current = setTimeout(() => {
+      // Find which clip this time corresponds to
+      let accumulatedTime = 0;
+      let targetClipIndex = 0;
+      let clipTime = 0;
+
+      for (let i = 0; i < sortedClips.length; i++) {
+        if (absoluteTime <= accumulatedTime + sortedClips[i].duration) {
+          targetClipIndex = i;
+          clipTime = absoluteTime - accumulatedTime;
+          break;
+        }
+        accumulatedTime += sortedClips[i].duration;
       }
-      accumulatedTime += sortedClips[i].duration;
-    }
-    
-    // Switch to target clip if needed
-    if (targetClipIndex !== currentClipIndex) {
-      onClipChange(targetClipIndex);
-    }
-    
-    // Seek to the correct time in the full video
-    setTimeout(() => {
-      if (videoRef.current && clips[targetClipIndex]) {
-        const targetClip = clips[targetClipIndex];
-        const videoTime = targetClip.start_time + clipTime;
-        videoRef.current.currentTime = videoTime;
-        setCurrentTime(clipTime);
+
+      // Switch to target clip if needed
+      if (targetClipIndex !== currentClipIndex) {
+        onClipChange(targetClipIndex);
       }
-    }, 100);
+
+      // Seek to the correct time in the clip file (which starts at 0)
+      setTimeout(() => {
+        if (primaryVideo && clips[targetClipIndex]) {
+          // Clip files start at 0, so just seek to clipTime directly
+          primaryVideo.currentTime = clipTime;
+          currentTimeRef.current = clipTime;
+          setCurrentTime(clipTime);
+        }
+      }, 50);
+    }, 150); // Debounce for 150ms
   };
 
   const handleVolumeToggle = () => {
-    if (!videoRef.current) return;
-    
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo) return;
+
     if (isMuted) {
-      videoRef.current.volume = volume;
+      primaryVideo.volume = volume;
       setIsMuted(false);
     } else {
-      videoRef.current.volume = 0;
+      primaryVideo.volume = 0;
       setIsMuted(true);
     }
   };
 
   const handleVolumeChange = (event: Event, newValue: number | number[]) => {
-    const newVolume = newValue as number;
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo) return;
+
+    const newVolume = (newValue as number) / 100;
+    primaryVideo.volume = newVolume;
     setVolume(newVolume);
-    
-    if (videoRef.current) {
-      videoRef.current.volume = newVolume;
-      setIsMuted(newVolume === 0);
-    }
+    setIsMuted(newVolume === 0);
   };
 
   // Update video element when playing state changes
   useEffect(() => {
-    if (!videoRef.current) return;
+    const primaryVideo = primaryVideoRef.current;
+    if (!primaryVideo) return;
+
+    console.log('PLAY EFFECT: isPlaying=', isPlaying, 'readyState=', primaryVideo.readyState, 'paused=', primaryVideo.paused, 'currentTime=', primaryVideo.currentTime);
+    console.log('  → currentClipIndex:', currentClipIndex, 'currentClip src:', currentClip?.stream_url?.substring(currentClip.stream_url.lastIndexOf('/') + 1));
 
     if (isPlaying) {
-      videoRef.current.play().catch(console.error);
-    } else {
-      videoRef.current.pause();
-    }
-  }, [isPlaying]);
+      // Try to play immediately if ready
+      if (primaryVideo.readyState >= 2 && primaryVideo.paused) {
+        console.log('→ Playing video now - currentTime:', primaryVideo.currentTime, 'duration:', primaryVideo.duration);
+        const playPromise = primaryVideo.play();
+        const playStartTime = performance.now();
+        playPromise
+          .then(() => {
+            const playDuration = performance.now() - playStartTime;
+            console.log('✓ Play succeeded in', playDuration.toFixed(2), 'ms');
+            // Check if video is actually progressing
+            setTimeout(() => {
+              console.log('  Video 50ms later: currentTime=', primaryVideo.currentTime, 'paused=', primaryVideo.paused);
+            }, 50);
+          })
+          .catch((err: unknown) => {
+            const e = err as { name?: string };
+            if (e?.name !== 'AbortError') {
+              console.error('Play error:', err);
+            } else {
+              console.log('Play aborted');
+            }
+          });
+      } else if (primaryVideo.readyState < 2) {
+        // Video not ready yet, wait for it to load
+        console.log('→ Waiting for canplay');
+        const handleCanPlay = () => {
+          if (primaryVideo.paused && isPlayingRef.current) {
+            console.log('→ canplay fired, playing now');
+            primaryVideo.play()
+              .then(() => {
+                console.log('✓ Play succeeded after canplay');
+              })
+              .catch((err: unknown) => {
+                const e = err as { name?: string };
+                if (e?.name !== 'AbortError') {
+                  console.error('Delayed play error:', err);
+                } else {
+                  console.log('Delayed play aborted');
+                }
+              });
+          }
+          primaryVideo.removeEventListener('canplay', handleCanPlay);
+        };
+        primaryVideo.addEventListener('canplay', handleCanPlay);
 
-  // Update video element when clip changes
+        // Cleanup function
+        return () => {
+          primaryVideo.removeEventListener('canplay', handleCanPlay);
+        };
+      } else {
+        console.log('→ Video already playing');
+      }
+    } else {
+      console.log('→ Pausing video');
+      primaryVideo.pause();
+    }
+  }, [isPlaying, currentClipIndex, currentClip]);
+
+
+  // Cleanup timeout on unmount
   useEffect(() => {
-    if (!videoRef.current || !currentClip) return;
-    
-    // Seek to the start time of the current clip
-    videoRef.current.currentTime = currentClip.start_time;
-    setCurrentTime(0);
-  }, [currentClipIndex, currentClip]);
+    return () => {
+      if (seekTimeoutRef.current) {
+        clearTimeout(seekTimeoutRef.current);
+      }
+    };
+  }, []);
 
   if (clips.length === 0) {
     return (
@@ -305,28 +435,24 @@ export const LivePreviewPlayer: React.FC<LivePreviewPlayerProps> = ({
 
   return (
     <Box className={className} style={style}>
-      {/* Video Element */}
-      <Box sx={{ position: 'relative', width: '100%', height: 'auto', backgroundColor: '#000' }}>
+      {/* Single Video Element - Much simpler and more reliable */}
+      <Box sx={{ position: 'relative', width: '100%', paddingTop: '56.25%', backgroundColor: '#000' }}>
         <video
-          ref={videoRef}
-          style={{ width: '100%', height: 'auto', maxHeight: '400px' }}
+          ref={primaryVideoRef}
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            transform: 'translateZ(0)',
+          }}
           onLoadedMetadata={handleLoadedMetadata}
           onTimeUpdate={handleTimeUpdate}
-          onEnded={handleEnded}
           onError={handleError}
           onLoadStart={() => setIsLoading(true)}
           onCanPlay={() => setIsLoading(false)}
-          onPlay={() => {
-            console.log('Video onPlay event triggered');
-            setIsPlaying(true);
-            isPlayingRef.current = true;
-          }}
-          onPause={() => {
-            console.log('Video onPause event triggered - this might be from load()');
-            // Don't update the ref here as it might be from load() causing a pause
-            // Only update the state for UI purposes
-            setIsPlaying(false);
-          }}
         />
         
         {/* Loading Overlay */}

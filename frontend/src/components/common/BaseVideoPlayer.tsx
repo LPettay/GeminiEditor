@@ -31,7 +31,7 @@ export interface BaseVideoPlayerProps {
   style?: React.CSSProperties;
   controls?: boolean;
   preload?: 'none' | 'metadata' | 'auto';
-  crossOrigin?: string;
+  crossOrigin?: 'anonymous' | 'use-credentials' | '';
   playsInline?: boolean;
 }
 
@@ -130,7 +130,7 @@ export const BaseVideoPlayer = forwardRef<VideoPlayerRef, BaseVideoPlayerProps>(
         onPlay={onPlay}
         onPause={onPause}
         onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => onLoadedMetadata?.(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => onLoadedMetadata?.(e.currentTarget.duration || 0)}
         onError={handleError}
         onLoadStart={onLoadStart}
         onCanPlay={onCanPlay}

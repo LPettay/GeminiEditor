@@ -8,7 +8,7 @@ import {
   Edit as EditIcon,
   Delete as DeleteIcon,
 } from '@mui/icons-material';
-import { EditDecision } from '../../api/client';
+import { type EditDecision } from '../../api/client';
 
 interface SegmentCardProps {
   decision: EditDecision;

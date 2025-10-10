@@ -14,7 +14,7 @@ import {
   Typography,
   Slider,
 } from '@mui/material';
-import { EditDecision } from '../../api/client';
+import { type EditDecision } from '../../api/client';
 
 interface TrimExtendModalProps {
   decision: EditDecision;

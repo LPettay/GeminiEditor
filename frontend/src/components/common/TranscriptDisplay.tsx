@@ -3,7 +3,7 @@
  * This component can be easily swapped out with different transcript UI implementations.
  */
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   Box,
   Typography,
@@ -13,9 +13,8 @@ import {
 } from '@mui/material';
 import {
   Sync as SyncIcon,
-  VolumeUp as VolumeUpIcon,
 } from '@mui/icons-material';
-import { TranscriptSegment, TranscriptWord, SyncState } from '../../services/transcriptSyncService';
+import { type TranscriptSegment, type TranscriptWord } from '../../services/transcriptSyncService';
 
 export interface TranscriptDisplayProps {
   segments: TranscriptSegment[];
@@ -41,7 +40,6 @@ export const TranscriptDisplay: React.FC<TranscriptDisplayProps> = ({
   style,
 }) => {
   const segmentRefs = useRef<{ [key: string]: HTMLDivElement | null }>({});
-  const [expandedSegments, setExpandedSegments] = useState<Set<string>>(new Set());
 
   // Auto-scroll to current segment
   useEffect(() => {
@@ -108,17 +106,7 @@ export const TranscriptDisplay: React.FC<TranscriptDisplayProps> = ({
     onWordClick?.(word, segment);
   };
 
-  const toggleSegmentExpansion = (segmentId: string) => {
-    setExpandedSegments(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(segmentId)) {
-        newSet.delete(segmentId);
-      } else {
-        newSet.add(segmentId);
-      }
-      return newSet;
-    });
-  };
+  // Expansion UI not currently shown; keep helper ready for future use
 
   if (segments.length === 0) {
     return (
@@ -150,13 +138,12 @@ export const TranscriptDisplay: React.FC<TranscriptDisplayProps> = ({
       }}
     >
       {segments.map((segment) => {
-        const isExpanded = expandedSegments.has(segment.id);
         const isCurrent = segment.id === currentSegmentId;
         
         return (
           <Paper
             key={segment.id}
-            ref={(el) => (segmentRefs.current[segment.id] = el)}
+            ref={(el) => { segmentRefs.current[segment.id] = el; }}
             style={getSegmentStyle(segment)}
             onClick={() => handleSegmentClick(segment)}
           >
@@ -227,25 +214,7 @@ export const TranscriptDisplay: React.FC<TranscriptDisplayProps> = ({
               )}
             </Box>
 
-            {/* Expandable detailed view */}
-            {isExpanded && (
-              <Box sx={{ mt: 2, p: 2, bgcolor: 'rgba(0, 0, 0, 0.02)', borderRadius: 1 }}>
-                <Typography variant="body2" color="text.secondary" gutterBottom>
-                  Word-level timestamps:
-                </Typography>
-                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                  {(segment.words || []).map((word, wordIndex) => (
-                    <Chip
-                      key={wordIndex}
-                      label={`${word.word} (${formatTime(word.start)})`}
-                      size="small"
-                      variant="outlined"
-                      style={getWordStyle(word, segment, wordIndex)}
-                    />
-                  ))}
-                </Box>
-              </Box>
-            )}
+            {/* Expandable detailed view (disabled in this build) */}
           </Paper>
         );
       })}

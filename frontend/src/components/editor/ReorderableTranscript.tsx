@@ -2,7 +2,7 @@
  * Reorderable Transcript - Drag & drop interface for rearranging transcript segments.
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -23,9 +23,9 @@ import {
   DragDropContext,
   Droppable,
   Draggable,
-  DropResult,
+  type DropResult,
 } from '@hello-pangea/dnd';
-import { TranscriptSegment, TranscriptWord } from '../../services/transcriptSyncService';
+import { type TranscriptSegment, type TranscriptWord } from '../../services/transcriptSyncService';
 
 export interface ReorderableTranscriptProps {
   segments: TranscriptSegment[];
@@ -67,7 +67,7 @@ export const ReorderableTranscript: React.FC<ReorderableTranscriptProps> = ({
   const [scrollOffset, setScrollOffset] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const autoScrollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const autoScrollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Track scroll position for drag alignment
   useEffect(() => {

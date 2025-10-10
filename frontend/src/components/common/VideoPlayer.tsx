@@ -11,7 +11,7 @@ import {
   VolumeUp as VolumeUpIcon,
   VolumeOff as VolumeOffIcon,
 } from '@mui/icons-material';
-import { BaseVideoPlayer, VideoPlayerRef } from './BaseVideoPlayer';
+import { BaseVideoPlayer, type VideoPlayerRef } from './BaseVideoPlayer';
 
 interface VideoPlayerProps {
   src: string;
@@ -23,7 +23,6 @@ interface VideoPlayerProps {
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   src,
-  title,
   onError,
   className,
   style,
@@ -107,16 +106,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   return (
     <Box
       className={className}
-      style={{
-        position: 'relative',
-        width: '100%',
-        height: '100%',
-        bgcolor: 'black',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        ...style,
-      }}
+      style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', ...style }}
     >
       <BaseVideoPlayer
         ref={videoRef}

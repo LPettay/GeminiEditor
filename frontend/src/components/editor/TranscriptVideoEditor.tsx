@@ -4,23 +4,11 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import {
-  Box,
-  Grid,
-  Paper,
-  Typography,
-  Button,
-  LinearProgress,
-  Alert,
-  Chip,
-} from '@mui/material';
-import {
-  PlayArrow as PlayIcon,
-  Pause as PauseIcon,
-  AutoAwesome as ProcessIcon,
-} from '@mui/icons-material';
+import { Box, Paper, Typography, Button, LinearProgress, Alert, Chip } from '@mui/material';
+// Icons removed if unused
 
 import { VideoPlayer } from '../common/VideoPlayer';
+import SequentialVideoPlayer from './SequentialVideoPlayer';
 import { TranscriptDisplay } from '../common/TranscriptDisplay';
 import { ReorderableTranscript } from './ReorderableTranscript';
 import { LivePreviewPlayer } from './LivePreviewPlayer';
@@ -34,7 +22,8 @@ interface VideoClip {
   order_index: number;
   stream_url: string;
 }
-import { TranscriptSegment, TranscriptSyncService, SyncState } from '../../services/transcriptSyncService';
+import { type TranscriptSegment as SyncSegment, TranscriptSyncService, type SyncState } from '../../services/transcriptSyncService';
+import { type TranscriptSegment as ApiSegment } from '../../api/client';
 import { apiClient } from '../../api/client';
 
 interface TranscriptVideoEditorProps {
@@ -74,8 +63,8 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   className,
   style,
 }) => {
-  const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
-  const [reorderedSegments, setReorderedSegments] = useState<TranscriptSegment[]>([]);
+  const [transcriptSegments, setTranscriptSegments] = useState<SyncSegment[]>([]);
+  const [reorderedSegments, setReorderedSegments] = useState<SyncSegment[]>([]);
   const [videoClips, setVideoClips] = useState<VideoClip[]>([]);
   const [syncState, setSyncState] = useState<SyncState>({
     currentSegmentId: null,
@@ -83,6 +72,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     isPlaying: false,
     currentTime: 0,
   });
+  const lastTimeUpdateRef = useRef(0);
   const [processingJob, setProcessingJob] = useState<ProcessingJob | null>(null);
   const [segmentationJob, setSegmentationJob] = useState<ProcessingJob | null>(null);
   const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
@@ -93,8 +83,8 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   
   const videoPlayerRef = useRef<any>(null);
   const syncServiceRef = useRef<TranscriptSyncService>(new TranscriptSyncService());
-  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const segmentationIntervalRef = useRef<NodeJS.Timeout | null>(null); // Added for segmentation polling
+  const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const segmentationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // Added for segmentation polling
   const processingJobRef = useRef<ProcessingJob | null>(null); // Add ref for current job state
   const segmentationJobRef = useRef<ProcessingJob | null>(null); // Add ref for current job state
 
@@ -102,12 +92,21 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   
   const loadExistingTranscript = useCallback(async () => {
     try {
-      const segments = await apiClient.getVideoTranscript(projectId, videoId);
-      setTranscriptSegments(segments);
-      setReorderedSegments(segments); // Initialize reordered segments
+      const apiSegments = await apiClient.getVideoTranscript(projectId, videoId);
+      const syncSegments: SyncSegment[] = apiSegments.map(s => ({
+        id: s.id,
+        start: s.start_time,
+        end: s.end_time,
+        text: s.text,
+        words: (s.words || []).map(w => ({ word: w.word, start: w.start, end: w.end, confidence: w.confidence })),
+        confidence: s.confidence ?? 1,
+        speaker: s.speaker,
+      }));
+      setTranscriptSegments(syncSegments);
+      setReorderedSegments(syncSegments);
       
-      if (segments.length > 0) {
-        syncServiceRef.current.setSegments(segments);
+      if (syncSegments.length > 0) {
+        syncServiceRef.current.setSegments(syncSegments);
       }
     } catch (error) {
       console.error('Error loading existing transcript:', error);
@@ -141,15 +140,17 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
       });
       
       // Preserve the original job_id from the current job if not in response
-      const updatedJob = {
-        ...status,
-        job_id: status.job_id || currentJob.job_id // Keep original job_id if missing from response
+      const updatedJob: ProcessingJob = {
+        job_id: status.job_id || currentJob.job_id,
+        status: (status.status === 'completed' ? 'completed' : status.status === 'failed' ? 'failed' : 'processing'),
+        progress: status.progress ?? 0,
+        message: status.message ?? '',
       };
       
       console.log('Updated job object:', updatedJob);
       
-      setProcessingJob(updatedJob);
-      processingJobRef.current = updatedJob; // Update ref as well
+      setProcessingJob(() => updatedJob as ProcessingJob);
+      processingJobRef.current = updatedJob;
       
       if (updatedJob.status === 'completed') {
         console.log('Transcript completed! Clearing interval and loading transcript...');
@@ -218,8 +219,8 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
       // Preserve the original job_id from the current job if not in response
       const updatedJob = {
         ...status,
-        job_id: status.job_id || currentJob.job_id // Keep original job_id if missing from response
-      };
+        job_id: status.job_id || currentJob.job_id,
+      } as ProcessingJob;
       
       console.log('Updated segmentation job object:', updatedJob);
       
@@ -365,7 +366,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
       
       const jobData = {
         job_id: response.job_id,
-        status: 'processing',
+        status: 'processing' as const,
         progress: 0,
         message: response.message,
       };
@@ -389,23 +390,34 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   const handleTimeUpdate = useCallback((absoluteTime: number, clipIndex: number) => {
     // Update sync state based on the current time in the reordered sequence
     // This is where we'll sync with the reordered transcript
-    console.log(`Time update: ${absoluteTime}s in clip ${clipIndex}`);
     
     // TODO: Implement transcript sync with reordered segments
     // For now, just update the basic sync state
-    setSyncState(prev => ({
-      ...prev,
-      currentTime: absoluteTime,
-    }));
+    
+    // Throttle updates to prevent infinite loops (only update every 500ms)
+    const now = Date.now();
+    if (now - lastTimeUpdateRef.current >= 500) {
+      setSyncState(prev => {
+        // Only update if time has changed significantly to prevent infinite loops
+        if (Math.abs(prev.currentTime - absoluteTime) >= 0.5) {
+          return {
+            ...prev,
+            currentTime: absoluteTime,
+          };
+        }
+        return prev; // No significant change, don't update
+      });
+      lastTimeUpdateRef.current = now;
+    }
   }, []);
 
-  const handleSegmentClick = (segment: TranscriptSegment) => {
+  const handleSegmentClick = (segment: SyncSegment) => {
     if (videoPlayerRef.current) {
       videoPlayerRef.current.seek(segment.start);
     }
   };
 
-  const handleWordClick = (word: any, segment: TranscriptSegment) => {
+  const handleWordClick = (word: any, segment: SyncSegment) => {
     if (videoPlayerRef.current) {
       videoPlayerRef.current.seek(word.start);
     }
@@ -422,7 +434,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
         throw new Error('No job ID returned from server');
       }
       
-      const jobData = {
+      const jobData: ProcessingJob = {
         job_id: response.job_id,
         status: 'processing',
         progress: 0,
@@ -436,7 +448,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     }
   };
 
-  const handleSegmentsReorder = (reorderedSegments: TranscriptSegment[]) => {
+  const handleSegmentsReorder = (reorderedSegments: SyncSegment[]) => {
     setReorderedSegments(reorderedSegments);
     
     // Update video clips to reflect the new order
@@ -456,7 +468,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     console.log('Segments reordered, updated video clips:', reorderedClips.length);
   };
 
-  const handleSegmentVideo = (segment: TranscriptSegment) => {
+  const handleSegmentVideo = (segment: SyncSegment) => {
     console.log('Creating video clip for segment:', segment.text);
     // This will be handled by the segmentation service
   };
@@ -475,7 +487,6 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
         {!hasTranscript && !isProcessing && (
           <Button
             variant="contained"
-            startIcon={<ProcessIcon />}
             onClick={generateTranscript}
             disabled={isLoadingTranscript}
             sx={{ mb: 2 }}
@@ -538,19 +549,24 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
               {editingMode === 'edit' && videoClips.length > 0 ? (
-                <LivePreviewPlayer
-                  clips={videoClips}
-                  currentClipIndex={currentClipIndex}
-                  onClipChange={handleClipChange}
+                <SequentialVideoPlayer
+                  clips={videoClips.map(c => ({
+                    decision_id: c.id,
+                    clip_url: c.stream_url,
+                    start_time: 0,
+                    end_time: c.duration,
+                    duration: c.duration,
+                    transcript_text: '',
+                    order_index: c.order_index,
+                  }))}
+                  projectId={projectId}
                   onTimeUpdate={handleTimeUpdate}
-                  style={{ flex: 1, minHeight: 0 }}
+                  onClipChange={handleClipChange}
                 />
               ) : (
                 <VideoPlayer
-                  ref={videoPlayerRef}
                   src={videoUrl}
                   title={videoTitle}
-                  onVideoReady={handleVideoReady}
                   style={{ flex: 1, minHeight: 0 }}
                 />
               )}
@@ -615,7 +631,6 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
                         <Button
                           variant="outlined"
                           size="small"
-                          startIcon={<ProcessIcon />}
                           onClick={segmentVideoForEditing}
                           disabled={isSegmentingVideo}
                         >

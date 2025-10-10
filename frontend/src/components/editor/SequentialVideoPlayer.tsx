@@ -3,6 +3,7 @@
  */
 
 import { useRef, useState, useEffect } from 'react';
+import Hls from 'hls.js';
 import { Box, IconButton, Slider, Typography, Paper } from '@mui/material';
 import {
   PlayArrow as PlayIcon,
@@ -11,20 +12,25 @@ import {
   VolumeOff as VolumeMuteIcon,
   Fullscreen as FullscreenIcon,
 } from '@mui/icons-material';
-import { ClipPreview } from '../../api/client';
+import { type ClipPreview } from '../../api/client';
 
 interface SequentialVideoPlayerProps {
   clips: ClipPreview[];
   onTimeUpdate?: (currentTime: number, clipIndex: number) => void;
   onClipChange?: (clipIndex: number) => void;
+  projectId?: string;
+  editId?: string;
 }
 
 export default function SequentialVideoPlayer({
   clips,
   onTimeUpdate,
   onClipChange,
+  projectId,
+  editId,
 }: SequentialVideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
@@ -35,39 +41,94 @@ export default function SequentialVideoPlayer({
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  const currentClip = clips[currentClipIndex];
   const totalDuration = clips.reduce((sum, clip) => sum + clip.duration, 0);
 
   // Calculate accumulated time up to current clip
-  const getAccumulatedTime = (clipIndex: number) => {
-    return clips.slice(0, clipIndex).reduce((sum, clip) => sum + clip.duration, 0);
-  };
+  const getAccumulatedTime = (clipIndex: number) => clips.slice(0, clipIndex).reduce((sum, c) => sum + c.duration, 0);
 
-  // Get global time (across all clips)
-  const globalTime = getAccumulatedTime(currentClipIndex) + currentTime;
+  // For HLS playlist, video.currentTime is already global timeline time
 
-  // Load clip when index changes
+  const isHlsMode = Boolean(projectId && editId);
+
+  // Initialize HLS once and whenever project/edit changes or EDL order changes
   useEffect(() => {
-    if (videoRef.current && currentClip) {
-      const video = videoRef.current;
-      video.src = currentClip.clip_url;
-      video.currentTime = 0;
-      
-      if (isPlaying) {
-        video.play().catch(console.error);
+    const video = videoRef.current;
+    if (!video || !isHlsMode) return;
+
+    const playlistUrl = `/api/projects/${projectId}/edits/${editId}/playlist.m3u8?t=${Date.now()}`;
+
+    // Cleanup existing instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        autoStartLoad: true,
+        lowLatencyMode: false,
+        backBufferLength: 0,
+        maxBufferLength: 30,
+      });
+      hlsRef.current = hls;
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        hls.loadSource(playlistUrl);
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (isPlaying) video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        // Swallow recoverable errors; log fatal
+        if (data.fatal) {
+          console.error('hls.js fatal error', data);
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari
+      video.src = playlistUrl;
+      video.addEventListener('loadedmetadata', () => {
+        if (isPlaying) video.play().catch(() => {});
+      }, { once: true });
+    }
+
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
       }
-      
+    };
+  }, [isHlsMode, projectId, editId, clips.map(c => c.decision_id).join('|'), isPlaying]);
+
+  // Fallback sequential mode: set src on clip/index change
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || isHlsMode) return;
+    const current = clips[currentClipIndex];
+    if (!current) return;
+    // Only update if different
+    const currentPath = video.src ? new URL(video.src, window.location.origin).pathname : '';
+    const nextPath = current.clip_url.startsWith('http') ? new URL(current.clip_url).pathname : current.clip_url;
+    if (currentPath !== nextPath) {
+      video.src = current.clip_url;
+      video.currentTime = 0;
+      if (isPlaying) {
+        video.play().catch(() => {});
+      }
       onClipChange?.(currentClipIndex);
     }
-  }, [currentClipIndex, currentClip]);
+  }, [isHlsMode, clips, currentClipIndex, isPlaying]);
 
-  // Handle video end - move to next clip
+  // Handle video end
   const handleVideoEnd = () => {
+    if (isHlsMode) {
+      setIsPlaying(false);
+      return;
+    }
     if (currentClipIndex < clips.length - 1) {
       setCurrentClipIndex(prev => prev + 1);
       setCurrentTime(0);
     } else {
-      // End of all clips
       setIsPlaying(false);
       setCurrentClipIndex(0);
       setCurrentTime(0);
@@ -76,38 +137,60 @@ export default function SequentialVideoPlayer({
 
   // Handle time update
   const handleTimeUpdate = () => {
-    if (videoRef.current) {
-      const time = videoRef.current.currentTime;
-      setCurrentTime(time);
-      onTimeUpdate?.(globalTime, currentClipIndex);
+    const video = videoRef.current;
+    if (!video) return;
+    const time = video.currentTime;
+    setCurrentTime(time);
+
+    if (isHlsMode) {
+      // Map HLS absolute time into clip index using cumulative durations
+      let acc = 0;
+      let idx = 0;
+      for (let i = 0; i < clips.length; i++) {
+        if (time < acc + clips[i].duration) { idx = i; break; }
+        acc += clips[i].duration;
+      }
+      if (idx !== currentClipIndex) {
+        setCurrentClipIndex(idx);
+        onClipChange?.(idx);
+      }
+      onTimeUpdate?.(time, idx);
+    } else {
+      const acc = getAccumulatedTime(currentClipIndex);
+      onTimeUpdate?.(acc + time, currentClipIndex);
     }
   };
 
   // Handle duration change
   const handleLoadedMetadata = () => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration);
-    }
+    const video = videoRef.current;
+    if (!video) return;
+    // duration corresponds to full playlist duration
+    setDuration(video.duration || totalDuration);
   };
 
   // Play/Pause
   const togglePlayPause = () => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        videoRef.current.pause();
-      } else {
-        videoRef.current.play().catch(console.error);
-      }
-      setIsPlaying(!isPlaying);
+    const video = videoRef.current;
+    if (!video) return;
+    if (isPlaying) {
+      video.pause();
+      setIsPlaying(false);
+    } else {
+      video.play().then(() => setIsPlaying(true)).catch(() => {});
     }
   };
 
   // Seek to global time
   const handleSeek = (newGlobalTime: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (isHlsMode) {
+      video.currentTime = newGlobalTime;
+      return;
+    }
     let accumulatedTime = 0;
     let targetClipIndex = 0;
-    
-    // Find which clip contains this time
     for (let i = 0; i < clips.length; i++) {
       if (newGlobalTime < accumulatedTime + clips[i].duration) {
         targetClipIndex = i;
@@ -115,21 +198,12 @@ export default function SequentialVideoPlayer({
       }
       accumulatedTime += clips[i].duration;
     }
-    
     const localTime = newGlobalTime - accumulatedTime;
-    
     if (targetClipIndex !== currentClipIndex) {
       setCurrentClipIndex(targetClipIndex);
-      // Will load new clip, then seek
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.currentTime = localTime;
-        }
-      }, 100);
+      setTimeout(() => { if (videoRef.current) { videoRef.current.currentTime = localTime; } }, 100);
     } else {
-      if (videoRef.current) {
-        videoRef.current.currentTime = localTime;
-      }
+      video.currentTime = localTime;
     }
   };
 
@@ -209,7 +283,7 @@ export default function SequentialVideoPlayer({
       >
         {/* Progress Bar */}
         <Slider
-          value={globalTime}
+          value={currentTime}
           min={0}
           max={totalDuration}
           onChange={(_, value) => handleSeek(value as number)}
@@ -231,7 +305,7 @@ export default function SequentialVideoPlayer({
 
           {/* Time Display */}
           <Typography variant="body2" sx={{ color: 'white', minWidth: 100 }}>
-            {formatTime(globalTime)} / {formatTime(totalDuration)}
+            {formatTime(currentTime)} / {formatTime(totalDuration)}
           </Typography>
 
           {/* Clip Indicator */}

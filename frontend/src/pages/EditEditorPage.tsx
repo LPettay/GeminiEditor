@@ -2,7 +2,7 @@
  * Edit Editor Page - Complete text-based editing interface
  */
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Container,
@@ -189,6 +189,8 @@ export default function EditEditorPage() {
           {previewData ? (
             <SequentialVideoPlayer
               clips={previewData.clips}
+              projectId={projectId!}
+              editId={editId!}
               onTimeUpdate={(time, clipIndex) => {
                 setCurrentClipIndex(clipIndex);
               }}

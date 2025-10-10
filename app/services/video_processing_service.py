@@ -180,6 +180,8 @@ class VideoProcessingService:
         segments = []
         segment_words = []
         current_segment_start = all_words[0].start
+        min_segment_duration = 3.0   # Minimum 3 seconds per segment
+        min_words_per_segment = 5    # Minimum 5 words per segment
         max_segment_duration = 15.0  # Maximum 15 seconds per segment
         max_words_per_segment = 50   # Maximum words per segment
         
@@ -187,26 +189,54 @@ class VideoProcessingService:
             segment_words.append(word)
             
             # Check if we should end the current segment
-            should_end_segment = False
             segment_duration = word.end - current_segment_start
             
-            # End segment if:
-            # 1. Maximum duration reached
-            # 2. Maximum word count reached
-            # 3. Natural sentence boundary (period, exclamation, question mark)
-            # 4. Significant pause (gap > 1.5 seconds)
-            # 5. Last word
-            if (segment_duration >= max_segment_duration or 
-                len(segment_words) >= max_words_per_segment or
-                cls._is_sentence_ending(word.word) or
-                cls._has_significant_pause(word, all_words, i) or
-                i == len(all_words) - 1):
-                should_end_segment = True
+            # Check if minimum requirements are met
+            meets_minimum = (segment_duration >= min_segment_duration and 
+                            len(segment_words) >= min_words_per_segment)
+            
+            # Check if maximum limits are exceeded
+            exceeds_maximum = (segment_duration >= max_segment_duration or 
+                              len(segment_words) >= max_words_per_segment)
+            
+            # Check for natural boundaries
+            has_natural_boundary = (cls._is_sentence_ending(word.word) or 
+                                   cls._has_significant_pause(word, all_words, i))
+            
+            # Only end segment if:
+            # 1. We've met minimum requirements AND have a natural boundary
+            # 2. OR we've exceeded maximum limits
+            # 3. OR it's the last word
+            should_end_segment = (
+                (meets_minimum and has_natural_boundary) or
+                exceeds_maximum or
+                i == len(all_words) - 1
+            )
             
             if should_end_segment and segment_words:
                 # Create segment from current words
                 segment_start = segment_words[0].start
-                segment_end = segment_words[-1].end
+                
+                # Calculate intelligent end time based on gap to next word
+                last_word = segment_words[-1]
+                if i < len(all_words) - 1:
+                    next_word = all_words[i + 1]
+                    gap = next_word.start - last_word.end
+                    
+                    if gap >= 0.3:  # If there's a silence gap of at least 0.3s
+                        # Cut in the middle of the silence
+                        segment_end = last_word.end + (gap / 2)
+                        next_segment_start = segment_end
+                    else:
+                        # No significant silence - add padding to capture full word
+                        # and start next segment slightly later to avoid overlap
+                        segment_end = last_word.end + 0.15  # 150ms padding
+                        next_segment_start = last_word.end + 0.05  # Small 50ms gap
+                else:
+                    # Last segment - add padding to capture final word
+                    segment_end = last_word.end + 0.2
+                    next_segment_start = segment_end
+                
                 segment_text = ' '.join(w.word for w in segment_words)
                 segment_confidence = sum(w.confidence for w in segment_words) / len(segment_words)
                 
@@ -224,7 +254,7 @@ class VideoProcessingService:
                 # Reset for next segment
                 segment_words = []
                 if i < len(all_words) - 1:
-                    current_segment_start = all_words[i + 1].start
+                    current_segment_start = next_segment_start
         
         return segments
     
@@ -245,8 +275,8 @@ class VideoProcessingService:
         next_word = all_words[current_index + 1]
         gap = next_word.start - current_word.end
         
-        # Consider a gap > 1.5 seconds as a significant pause
-        return gap > 1.5
+        # Consider a gap > 2.0 seconds as a significant pause (increased from 1.5s)
+        return gap > 2.0
     
     @classmethod
     async def _extract_video_metadata(cls, video_path: str) -> Dict[str, Any]:

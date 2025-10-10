@@ -3,7 +3,7 @@
  * Provides typed methods for all API endpoints.
  */
 
-import axios, { AxiosInstance } from 'axios';
+import axios, { type AxiosInstance } from 'axios';
 
 // ==================== TYPE DEFINITIONS ====================
 
@@ -187,11 +187,6 @@ class ApiClient {
     return response.data;
   }
 
-  async getVideoTranscript(projectId: string, videoId: string): Promise<TranscriptSegment[]> {
-    const response = await this.client.get(`/api/projects/${projectId}/source-videos/${videoId}/transcript`);
-    return response.data;
-  }
-
   async updateSourceVideo(
     projectId: string,
     videoId: string,
@@ -221,7 +216,7 @@ class ApiClient {
     return response.data;
   }
 
-  async getVideoTranscript(projectId: string, videoId: string): Promise<any[]> {
+  async getVideoTranscript(projectId: string, videoId: string): Promise<TranscriptSegment[]> {
     const response = await this.client.get(`/api/projects/${projectId}/source-videos/${videoId}/transcript`);
     return response.data;
   }

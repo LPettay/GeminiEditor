@@ -13,7 +13,7 @@ import {
 } from '@mui/material';
 import { Save as SaveIcon } from '@mui/icons-material';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import apiClient, { Project } from '../../api/client';
+import apiClient, { type Project } from '../../api/client';
 
 interface SettingsTabProps {
   project: Project;

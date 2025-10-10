@@ -9,7 +9,6 @@ import {
   Button,
   ButtonGroup,
   IconButton,
-  Collapse,
   Alert,
 } from '@mui/material';
 import {
@@ -22,7 +21,7 @@ import {
   Delete as DeleteIcon,
 } from '@mui/icons-material';
 import SegmentCard from './SegmentCard';
-import { EditDecision } from '../../api/client';
+import { type EditDecision } from '../../api/client';
 import { useEditorStore } from '../../store/editorStore';
 
 interface TranscriptTimelineProps {

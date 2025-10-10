@@ -3,7 +3,7 @@
  */
 
 import { create } from 'zustand';
-import { Edit, EditDecision } from '../api/client';
+import { type Edit, type EditDecision } from '../api/client';
 
 interface EditorStore {
   // Current edit
