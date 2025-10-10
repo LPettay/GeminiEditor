@@ -3,6 +3,7 @@ load_dotenv()
 
 from fastapi import FastAPI, File, UploadFile, Form, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import json
@@ -166,7 +167,48 @@ logger.info("--- CUDA check complete ---")
 # Constants
 # GEMINI_CHUNK_SIZE = 250 # Define chunk size for Gemini processing (used for Pass 2) # Now from AppConfig
 
+# --- Import Database ---
+from .database import init_db, get_db
+from .models import Project, SourceVideo, TranscriptSegment, Edit, EditDecision
+from sqlalchemy.orm import Session
+# --- End Database Import ---
+
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Register API routers
+from app.api import projects_router, source_videos_router, edits_router, processing_router
+app.include_router(projects_router)
+app.include_router(source_videos_router)
+app.include_router(edits_router)
+app.include_router(processing_router)
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and perform startup tasks."""
+    logger.info("Starting application initialization...")
+    init_db()
+    logger.info("Database initialized successfully")
+    
+    # Start periodic cleanup task
+    asyncio.create_task(periodic_cleanup())
+    logger.info("Started periodic cleanup task")
+    
+    # Log file store status
+    logger.info(f"File store contains {len(file_store)} entries")
+    for file_id, file_path in file_store.items():
+        exists = os.path.exists(file_path)
+        size = os.path.getsize(file_path) if exists else 0
+        logger.info(f"  {file_id}: {file_path} (exists: {exists}, size: {size} bytes)")
 
 UPLOAD_DIR = "uploads"
 PROCESSED_DIR = "processed"
@@ -970,7 +1012,16 @@ async def process_video(
     scope_end_seconds: float | None = Form(None, description="If provided with scope_start_seconds, trim the input video ending at this second before any processing."),
 
     # Extra context for Gemini
-    video_context: str = Form("", description="Optional short context Gemini should know (e.g. 'Dark Souls 1 livestream, Undead Parish')")
+    video_context: str = Form("", description="Optional short context Gemini should know (e.g. 'Dark Souls 1 livestream, Undead Parish')"),
+    
+    # Vision extension settings
+    enable_vision_extension: bool = Form(False, description="Enable AI vision analysis to extend video clips for better context"),
+    
+    # Multimodal processing settings
+    enable_multimodal_pass2: bool = Form(True, description="Enable multimodal Pass 2 processing (uploads video to Google for AI analysis)"),
+    
+    # Simple mode settings
+    simple_mode: bool = Form(False, description="Simple mode: Skip all complex processing, just concatenate selected clips based on prompt")
 ):
     # Limit concurrent processing to prevent file descriptor exhaustion
     async with processing_semaphore:
@@ -1047,14 +1098,35 @@ async def process_video(
 
                 if not os.path.exists(trimmed_path):
                     logger.info(f"Trimming input video to scope {scope_start_seconds:.2f}s - {scope_end_seconds:.2f}s -> {trimmed_path}")
+                    
+                    # First, probe the input video to see how many audio tracks it has
+                    probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_streams", "-print_format", "json", input_path]
+                    try:
+                        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                        audio_streams = json.loads(probe_result.stdout).get('streams', [])
+                        num_audio_tracks = len(audio_streams)
+                        logger.info(f"Original video has {num_audio_tracks} audio tracks")
+                    except Exception as e:
+                        logger.warning(f"Could not probe audio tracks: {e}. Assuming 1 audio track.")
+                        num_audio_tracks = 1
+                    
+                    # Build FFmpeg command with explicit audio stream mapping
                     ff_cmd = [
                         "ffmpeg", "-nostdin", "-y",
                         "-ss", str(scope_start_seconds),
                         "-to", str(scope_end_seconds),
                         "-i", input_path,
-                        "-c", "copy",
-                        trimmed_path,
+                        "-c:v", "copy",  # Copy video stream
+                        "-map", "0:v:0"  # Explicitly map the first video stream
                     ]
+                    
+                    # Map all audio streams
+                    for i in range(num_audio_tracks):
+                        ff_cmd.extend(["-map", f"0:a:{i}"])
+                    
+                    ff_cmd.append(trimmed_path)
+                    
+                    logger.info(f"FFmpeg command: {' '.join(ff_cmd)}")
                     subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                 else:
                     logger.info(f"Using existing trimmed scope file: {trimmed_path}")
@@ -1460,117 +1532,132 @@ async def process_video(
                                 continue
 
                             last = merged_segments[-1]
-                            # If the current segment overlaps or directly abuts the previous (<= 0.05 s gap), merge them
-                            if seg['start'] <= last['end'] + 1e-3:  # using small epsilon to account for float rounding
+                            # If the current segment overlaps or directly abuts the previous (<= 0.1 s gap), merge them
+                            if seg['start'] <= last['end'] + 0.01:  # using 0.01s threshold to account for float rounding
                                 last['end'] = max(last['end'], seg['end'])
                             else:
                                 merged_segments.append(seg)
 
                         # Optional: visual analysis to extend clips if needed
-                        vision_service = GeminiVisionService(api_key=app_config.gemini_config.api_key)
-                        analysed_segments: List[Dict[str, float]] = []
-                        first_vision_error_logged = False  # Log full traceback only once to keep console readable
-                        for clip_idx, seg in enumerate(merged_segments, start=1):
-                            tmp_clip_path = None
-                            try:
-                                # --- create temporary clip for vision analysis ---
-                                tmp_fd, tmp_clip_path = tempfile.mkstemp(suffix=".mp4", prefix="vision_clip_")
-                                os.close(tmp_fd)  # We'll use ffmpeg to write to this path
-                                register_temp_file(tmp_clip_path)  # Register for cleanup
+                        if enable_vision_extension:
+                            logger.info("Vision extension enabled - analyzing clips for optimal context")
+                            vision_service = GeminiVisionService(api_key=app_config.gemini_config.api_key)
+                            analysed_segments: List[Dict[str, float]] = []
+                            first_vision_error_logged = False  # Log full traceback only once to keep console readable
+                            for clip_idx, seg in enumerate(merged_segments, start=1):
+                                tmp_clip_path = None
+                                try:
+                                    # --- create temporary clip for vision analysis ---
+                                    tmp_fd, tmp_clip_path = tempfile.mkstemp(suffix=".mp4", prefix="vision_clip_")
+                                    os.close(tmp_fd)  # We'll use ffmpeg to write to this path
+                                    register_temp_file(tmp_clip_path)  # Register for cleanup
 
-                                # Build a clip for vision that includes user-specified context padding
-                                vision_clip_start = max(0.0, seg['start'] - pad_before_seconds)
-                                vision_clip_end   = seg['end'] + pad_after_seconds
+                                    # Build a clip for vision that includes user-specified context padding
+                                    vision_clip_start = max(0.0, seg['start'] - pad_before_seconds)
+                                    vision_clip_end   = seg['end'] + pad_after_seconds
 
-                                # Use ffmpeg copy to produce this clip quickly (no re-encode)
-                                ffmpeg_cmd = [
-                                    "ffmpeg", "-nostdin", "-y",
-                                    "-ss", str(vision_clip_start),
-                                    "-to", str(vision_clip_end),
-                                    "-i", input_path,
-                                    "-c", "copy",
-                                    tmp_clip_path,
-                                ]
+                                    # Use ffmpeg copy to produce this clip quickly (no re-encode)
+                                    ffmpeg_cmd = [
+                                        "ffmpeg", "-nostdin", "-y",
+                                        "-ss", str(vision_clip_start),
+                                        "-to", str(vision_clip_end),
+                                        "-i", input_path,
+                                        "-c", "copy",
+                                        tmp_clip_path,
+                                    ]
 
-                                # Run ffmpeg synchronously in a thread to stay compatible with Windows' Proactor loop
-                                proc_result = await asyncio.to_thread(
-                                    subprocess.run,
-                                    ffmpeg_cmd,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    check=False,
-                                )
+                                    # Run ffmpeg synchronously in a thread to stay compatible with Windows' Proactor loop
+                                    proc_result = await asyncio.to_thread(
+                                        subprocess.run,
+                                        ffmpeg_cmd,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        check=False,
+                                    )
 
-                                if proc_result.returncode != 0:
-                                    logger.warning(f"FFmpeg failed to make temp clip {tmp_clip_path}. Skipping vision analysis for this segment.")
-                                    extend_before = extend_after = 0.0
+                                    if proc_result.returncode != 0:
+                                        logger.warning(f"FFmpeg failed to make temp clip {tmp_clip_path}. Skipping vision analysis for this segment.")
+                                        extend_before = extend_after = 0.0
+                                    else:
+                                        extend_before, extend_after = await vision_service.analyse_clip(
+                                            clip_path=tmp_clip_path,
+                                            transcript_slice=None
+                                        )
+                                        logger.info(
+                                            f"[Vision] Clip {clip_idx}/{len(merged_segments)} "
+                                            f"{seg['start']:.2f}-{seg['end']:.2f}s -> "
+                                            f"extend_before={extend_before:.2f}, extend_after={extend_after:.2f}"
+                                        )
+                                except Exception as e_vis:
+                                    if not first_vision_error_logged:
+                                        logger.error(
+                                            f"Vision analysis failed for seg {seg}: {e_vis}. Traceback follows.",
+                                            exc_info=True,
+                                        )
+                                        first_vision_error_logged = True
+                                    else:
+                                        logger.warning(
+                                            f"Vision analysis failed for seg {seg}: {e_vis}. (Full traceback logged earlier). Using original padding."
+                                        )
+                                    extend_before, extend_after = 0.0, 0.0
+                                finally:
+                                    # Clean up temp clip file immediately after use
+                                    if tmp_clip_path and os.path.exists(tmp_clip_path):
+                                        try:
+                                            os.remove(tmp_clip_path)
+                                            active_temp_files.discard(tmp_clip_path)  # Remove from tracking
+                                        except OSError:
+                                            pass
+
+                                # Apply user padding *only if* Vision decided to extend the clip.
+                                if extend_before > 0 or extend_after > 0:
+                                    # Vision decided to include some of the context. Only include the amount it asked for.
+                                    new_start = max(0.0, seg['start'] - extend_before)
+                                    new_end   = seg['end'] + extend_after
                                 else:
-                                    extend_before, extend_after = await vision_service.analyse_clip(
-                                        clip_path=tmp_clip_path,
-                                        transcript_slice=None
-                                    )
-                                    logger.info(
-                                        f"[Vision] Clip {clip_idx}/{len(merged_segments)} "
-                                        f"{seg['start']:.2f}-{seg['end']:.2f}s -> "
-                                        f"extend_before={extend_before:.2f}, extend_after={extend_after:.2f}"
-                                    )
-                            except Exception as e_vis:
-                                if not first_vision_error_logged:
-                                    logger.error(
-                                        f"Vision analysis failed for seg {seg}: {e_vis}. Traceback follows.",
-                                        exc_info=True,
-                                    )
-                                    first_vision_error_logged = True
+                                    # Vision kept the clip as-is – no user padding in final render.
+                                    new_start = seg['start']
+                                    new_end   = seg['end']
+
+                                if new_start < new_end:
+                                    analysed_segments.append({'start': new_start, 'end': new_end})
                                 else:
-                                    logger.warning(
-                                        f"Vision analysis failed for seg {seg}: {e_vis}. (Full traceback logged earlier). Using original padding."
-                                    )
-                                extend_before, extend_after = 0.0, 0.0
-                            finally:
-                                # Clean up temp clip file immediately after use
-                                if tmp_clip_path and os.path.exists(tmp_clip_path):
-                                    try:
-                                        os.remove(tmp_clip_path)
-                                        active_temp_files.discard(tmp_clip_path)  # Remove from tracking
-                                    except OSError:
-                                        pass
+                                    analysed_segments.append(seg)  # fallback
 
-                            # Apply user padding *only if* Vision decided to extend the clip.
-                            if extend_before > 0 or extend_after > 0:
-                                # Vision decided to include some of the context. Only include the amount it asked for.
-                                new_start = max(0.0, seg['start'] - extend_before)
-                                new_end   = seg['end'] + extend_after
-                            else:
-                                # Vision kept the clip as-is – no user padding in final render.
-                                new_start = seg['start']
-                                new_end   = seg['end']
+                            # Re-merge after potential extension
+                            analysed_segments.sort(key=lambda s: s['start'])
+                            final_segments: List[Dict[str, float]] = []
+                            for seg in analysed_segments:
+                                if not final_segments:
+                                    final_segments.append(seg)
+                                    continue
+                                last = final_segments[-1]
+                                if seg['start'] <= last['end'] + 0.01:
+                                    last['end'] = max(last['end'], seg['end'])
+                                else:
+                                    final_segments.append(seg)
 
-                            if new_start < new_end:
-                                analysed_segments.append({'start': new_start, 'end': new_end})
-                            else:
-                                analysed_segments.append(seg)  # fallback
-
-                        # Re-merge after potential extension
-                        analysed_segments.sort(key=lambda s: s['start'])
-                        final_segments: List[Dict[str, float]] = []
-                        for seg in analysed_segments:
-                            if not final_segments:
-                                final_segments.append(seg)
-                                continue
-                            last = final_segments[-1]
-                            if seg['start'] <= last['end'] + 1e-3:
-                                last['end'] = max(last['end'], seg['end'])
-                            else:
-                                final_segments.append(seg)
-
-                        formatted_candidate_edl_for_ffmpeg = final_segments
-                        logger.info(f"Segment count after vision extension & re-merge: {len(formatted_candidate_edl_for_ffmpeg)}")
+                            formatted_candidate_edl_for_ffmpeg = final_segments
+                            logger.info(f"Segment count after vision extension & re-merge: {len(formatted_candidate_edl_for_ffmpeg)}")
+                        else:
+                            logger.info("Vision extension disabled - using original segments with user padding")
+                            # When vision extension is disabled, just apply user padding to original segments
+                            formatted_candidate_edl_for_ffmpeg = []
+                            for seg in merged_segments:
+                                padded_start = max(0.0, seg['start'] - pad_before_seconds)
+                                padded_end = seg['end'] + pad_after_seconds
+                                formatted_candidate_edl_for_ffmpeg.append({
+                                    'start': padded_start,
+                                    'end': padded_end
+                                })
+                            logger.info(f"Segment count with user padding only: {len(formatted_candidate_edl_for_ffmpeg)}")
 
                         await asyncio.to_thread(
                             cut_and_concatenate,
                             input_path, 
                             formatted_candidate_edl_for_ffmpeg,
-                            candidate_video_path
+                            candidate_video_path,
+                            audio_track
                         )
                         logger.info(f"New candidate video successfully generated and saved to: {candidate_video_path}")
                     except Exception as e_candidate_video:
@@ -1643,67 +1730,104 @@ async def process_video(
 
                 logger.info("--- Finished Intermediate Step 3: Transcribe Candidate Video ---")
 
-                # --- Intermediate Step 4: Refine Video with Multimodal Pass 2 (Text Output Workflow) ---
-                logger.info("--- Starting Intermediate Step 4: Refine Video with Multimodal Pass 2 (Text Output) ---")
-                pass2_selected_text_segments: List[str] = []
-                final_pass2_edl: List[Dict[str, Any]] = [] # This will be the EDL for the *final* video
-                pass2_text_output_path: Optional[str] = None # Path for saving P2's text output
-                pass2_matched_edl_path: Optional[str] = None # Path for saving the EDL from text matching
-
-                if candidate_video_path and os.path.exists(candidate_video_path):
-                    logger.info(f"Calling Multimodal Pass 2 with candidate video: {candidate_video_path}")
-                    try:
-                        pass2_selected_text_segments = await asyncio.to_thread(
-                            refine_video_with_multimodal_pass2,
-                            candidate_video_path=candidate_video_path,
-                            user_prompt=gemini_user_prompt_to_use,
-                            allow_reordering=app_config.feature_flags.allow_reordering,
-                            allow_repetition=app_config.feature_flags.allow_repetition,
-                            gemini_api_key=app_config.gemini_config.api_key
-                        )
-                    except Exception as e_pass2_gemini:
-                        logger.error(f"Error during Multimodal Pass 2 (refine_video_with_multimodal_pass2) call: {e_pass2_gemini}", exc_info=True)
-                        pass2_selected_text_segments = [] # Ensure it's an empty list on error
+                # --- Simple Mode: Skip all complex processing ---
+                if simple_mode:
+                    logger.info("--- Simple Mode: Creating final video from candidate video segments ---")
                     
-                    if pass2_selected_text_segments:
-                        logger.info(f"Multimodal Pass 2 returned {len(pass2_selected_text_segments)} selected text segments.")
-                        pass2_text_output_path = os.path.join(TRANSCRIPTS_DIR, f"{base_name}_pass2_multimodal_text_output_{run_timestamp}.json")
-                        save_json_to_file(pass2_selected_text_segments, pass2_text_output_path)
-                        logger.info(f"Multimodal Pass 2 raw text output saved to: {pass2_text_output_path}")
+                    # Use the candidate video directly as the final output
+                    final_simple_video_path = os.path.join(PROCESSED_DIR, f"{base_name}_simple_final_{run_timestamp}.mp4")
+                    
+                    try:
+                        # Copy the candidate video to the final output location
+                        shutil.copy2(candidate_video_path, final_simple_video_path)
+                        logger.info(f"Simple mode: Final video created at {final_simple_video_path}")
+                        
+                        # Set the response payload for simple mode
+                        response_payload = {
+                            "message": "Simple mode processing completed successfully",
+                            "status": "completed",
+                            "processing_time_seconds": round(time.time() - start_time, 2),
+                            "final_video_path": final_simple_video_path,
+                            "simple_mode": True,
+                            "candidate_video_path": candidate_video_path,
+                            "transcript_file": pass1_verbatim_script_path,
+                            "total_segments": len(candidate_video_edl) if candidate_video_edl else 0
+                        }
+                        
+                        return JSONResponse(response_payload)
+                        
+                    except Exception as e_simple:
+                        logger.error(f"Error in simple mode: {e_simple}", exc_info=True)
+                        return JSONResponse(status_code=500, content={"message": f"Error in simple mode: {str(e_simple)}"})
 
-                        # Now, match these text segments to the candidate video's transcript
-                        if candidate_video_transcript_segments:
-                            logger.info("Matching Pass 2 selected text segments to candidate video transcript timestamps...")
-                            similarity_p2_matching = getattr(app_config, 'matching_similarity_threshold_pass2', 80)
-                            try:
-                                final_pass2_edl = await asyncio.to_thread(
-                                    match_text_segments_to_transcript_timestamps,
-                                    selected_text_segments=pass2_selected_text_segments,
-                                    candidate_transcript_segments=candidate_video_transcript_segments,
-                                    similarity_threshold=similarity_p2_matching
-                                )
-                                if final_pass2_edl:
-                                    logger.info(f"Successfully matched {len(final_pass2_edl)} Pass 2 text segments, forming final EDL.")
-                                    pass2_matched_edl_path = os.path.join(TRANSCRIPTS_DIR, f"{base_name}_pass2_final_matched_edl_{run_timestamp}.json")
-                                    save_json_to_file(final_pass2_edl, pass2_matched_edl_path)
-                                    logger.info(f"Final EDL from Pass 2 text matching saved to: {pass2_matched_edl_path}")
-                                else:
-                                    logger.warning("match_text_segments_to_transcript_timestamps returned an empty EDL after Pass 2 text selection.")
-                                    # final_pass2_edl is already an empty list if this path is taken
-                            except Exception as e_match_p2_text:
-                                logger.error(f"Error during match_text_segments_to_transcript_timestamps: {e_match_p2_text}", exc_info=True)
-                                final_pass2_edl = [] # Ensure empty on error
+                # --- Intermediate Step 4: Refine Video with Multimodal Pass 2 (Text Output Workflow) ---
+                if enable_multimodal_pass2:
+                    logger.info("--- Starting Intermediate Step 4: Refine Video with Multimodal Pass 2 (Text Output) ---")
+                    pass2_selected_text_segments: List[str] = []
+                    final_pass2_edl: List[Dict[str, Any]] = [] # This will be the EDL for the *final* video
+                    pass2_text_output_path: Optional[str] = None # Path for saving P2's text output
+                    pass2_matched_edl_path: Optional[str] = None # Path for saving the EDL from text matching
+
+                    if candidate_video_path and os.path.exists(candidate_video_path):
+                        logger.info(f"Calling Multimodal Pass 2 with candidate video: {candidate_video_path}")
+                        try:
+                            pass2_selected_text_segments = await asyncio.to_thread(
+                                refine_video_with_multimodal_pass2,
+                                candidate_video_path=candidate_video_path,
+                                user_prompt=gemini_user_prompt_to_use,
+                                allow_reordering=app_config.feature_flags.allow_reordering,
+                                allow_repetition=app_config.feature_flags.allow_repetition,
+                                gemini_api_key=app_config.gemini_config.api_key
+                            )
+                        except Exception as e_pass2_gemini:
+                            logger.error(f"Error during Multimodal Pass 2 (refine_video_with_multimodal_pass2) call: {e_pass2_gemini}", exc_info=True)
+                            pass2_selected_text_segments = [] # Ensure it's an empty list on error
+                        
+                        if pass2_selected_text_segments:
+                            logger.info(f"Multimodal Pass 2 returned {len(pass2_selected_text_segments)} selected text segments.")
+                            pass2_text_output_path = os.path.join(TRANSCRIPTS_DIR, f"{base_name}_pass2_multimodal_text_output_{run_timestamp}.json")
+                            save_json_to_file(pass2_selected_text_segments, pass2_text_output_path)
+                            logger.info(f"Multimodal Pass 2 raw text output saved to: {pass2_text_output_path}")
+
+                            # Now, match these text segments to the candidate video's transcript
+                            if candidate_video_transcript_segments:
+                                logger.info("Matching Pass 2 selected text segments to candidate video transcript timestamps...")
+                                similarity_p2_matching = getattr(app_config, 'matching_similarity_threshold_pass2', 80)
+                                try:
+                                    final_pass2_edl = await asyncio.to_thread(
+                                        match_text_segments_to_transcript_timestamps,
+                                        selected_text_segments=pass2_selected_text_segments,
+                                        candidate_transcript_segments=candidate_video_transcript_segments,
+                                        similarity_threshold=similarity_p2_matching
+                                    )
+                                    if final_pass2_edl:
+                                        logger.info(f"Successfully matched {len(final_pass2_edl)} Pass 2 text segments, forming final EDL.")
+                                        pass2_matched_edl_path = os.path.join(TRANSCRIPTS_DIR, f"{base_name}_pass2_final_matched_edl_{run_timestamp}.json")
+                                        save_json_to_file(final_pass2_edl, pass2_matched_edl_path)
+                                        logger.info(f"Final EDL from Pass 2 text matching saved to: {pass2_matched_edl_path}")
+                                    else:
+                                        logger.warning("match_text_segments_to_transcript_timestamps returned an empty EDL after Pass 2 text selection.")
+                                        # final_pass2_edl is already an empty list if this path is taken
+                                except Exception as e_match_p2_text:
+                                    logger.error(f"Error during match_text_segments_to_transcript_timestamps: {e_match_p2_text}", exc_info=True)
+                                    final_pass2_edl = [] # Ensure empty on error
+                            else:
+                                logger.error("Candidate video transcript segments are not available. Cannot match Pass 2 text output to get timestamps.")
+                                # final_pass2_edl remains empty
                         else:
-                            logger.error("Candidate video transcript segments are not available. Cannot match Pass 2 text output to get timestamps.")
+                            logger.warning("Multimodal Pass 2 returned no selected text segments. No final EDL will be generated from Pass 2.")
                             # final_pass2_edl remains empty
                     else:
-                        logger.warning("Multimodal Pass 2 returned no selected text segments. No final EDL will be generated from Pass 2.")
-                        # final_pass2_edl remains empty
-                else:
-                    logger.warning("Candidate video not available. Skipping Multimodal Pass 2 and subsequent text matching.")
-                    # pass2_selected_text_segments and final_pass2_edl remain empty lists
+                        logger.warning("Candidate video not available. Skipping Multimodal Pass 2 and subsequent text matching.")
+                        # pass2_selected_text_segments and final_pass2_edl remain empty lists
                 
-                logger.info("--- Finished Intermediate Step 4 ---")
+                    logger.info("--- Finished Intermediate Step 4 ---")
+                else:
+                    logger.info("Multimodal Pass 2 disabled - skipping video upload and AI analysis")
+                    pass2_selected_text_segments: List[str] = []
+                    final_pass2_edl: List[Dict[str, Any]] = []
+                    pass2_text_output_path: Optional[str] = None
+                    pass2_matched_edl_path: Optional[str] = None
 
                 # --- Intermediate Step 5: Final Video Assembly from Pass 2 EDL ---
                 logger.info("--- Starting Intermediate Step 5: Final Video Assembly from Pass 2 EDL ---")
@@ -1789,19 +1913,6 @@ async def periodic_cleanup():
             logger.debug("Periodic cleanup completed")
         except Exception as e:
             logger.error(f"Error during periodic cleanup: {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    """Startup event to initialize periodic cleanup"""
-    asyncio.create_task(periodic_cleanup())
-    logger.info("Started periodic cleanup task")
-    
-    # Log file store status
-    logger.info(f"File store contains {len(file_store)} entries")
-    for file_id, file_path in file_store.items():
-        exists = os.path.exists(file_path)
-        size = os.path.getsize(file_path) if exists else 0
-        logger.info(f"  {file_id}: {file_path} (exists: {exists}, size: {size} bytes)")
 
 @app.get("/debug/file-store")
 async def debug_file_store():

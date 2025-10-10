@@ -13,6 +13,13 @@ import {
   Step,
   StepLabel,
   Alert,
+  TextField,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  Chip,
+  Checkbox,
 } from '@mui/material';
 import { useMutation } from '@tanstack/react-query';
 import axios from 'axios';
@@ -27,6 +34,10 @@ export interface UploadFormValues {
   scopeEnd?: number;
   audioTrack?: number;
   fileId?: string;
+  prompt?: string;
+  enableVisionExtension?: boolean;
+  enableMultimodalPass2?: boolean;
+  simpleMode?: boolean;
 }
 
 // utility to extract filename from FileList
@@ -37,6 +48,14 @@ interface Props {
   isSubmitting?: boolean;
 }
 
+// Preset prompts for different video styles
+const PRESET_PROMPTS = {
+  default: "Create a highly entertaining video edited in the style of popular online comedians like Jerma985, BedBanana, or General Sam. Focus on highlighting the speaker's unique personality, comedic timing, absurd moments, and genuine reactions. Prioritize fast-paced, funny, and engaging mini-narratives or highlight reel moments. If there are setups and punchlines for jokes, try to capture them.",
+  educational: "Create an educational video that clearly explains concepts and maintains viewer engagement. Focus on clear explanations, visual demonstrations, and logical flow. Highlight key learning moments and ensure the content is easy to follow and understand.",
+  gaming: "Create an exciting gaming highlight reel that showcases the best moments, epic plays, and funny reactions. Focus on action-packed sequences, clutch moments, and entertaining commentary. Make it fast-paced and engaging for gaming audiences.",
+  vlog: "Create a personal vlog-style video that captures authentic moments and tells a compelling story. Focus on genuine emotions, personal insights, and natural flow. Highlight meaningful interactions and create a narrative that connects with viewers."
+};
+
 const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
   const {
     control,
@@ -46,7 +65,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     setValue,
     formState: { errors },
   } = useForm<UploadFormValues>({
-    defaultValues: { scopeStart: undefined, scopeEnd: undefined },
+    defaultValues: { scopeStart: undefined, scopeEnd: undefined, prompt: '', enableVisionExtension: false, enableMultimodalPass2: true, simpleMode: false },
   });
 
   const watchedFiles = watch('video');
@@ -56,7 +75,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
   const [isProcessing, setIsProcessing] = useState(false); // server processing stage
   const [jobId, setJobId] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
-  // UI step: 0=file select, 1=upload/analyze, 2=audio track, 3=scope & submit
+  // UI step: 0=file select, 1=upload/analyze, 2=audio track, 3=scope, 4=prompt & submit
   const [activeStep, setActiveStep] = useState(0);
   const [originalName, setOriginalName] = useState<string | null>(null);
   const [isDuplicate, setIsDuplicate] = useState(false);
@@ -172,7 +191,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     } else {
       setActiveStep(0);
     }
-  }, [watchedFiles, setValue]);
+  }, [watchedFiles]); // Removed setValue from dependencies
 
   // Subscribe to SSE progress once we have a jobId
   useEffect(() => {
@@ -212,7 +231,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
     };
 
     return () => es.close();
-  }, [jobId, setValue]);
+  }, [jobId]); // Removed setValue from dependencies
 
   return (
     <Box 
@@ -229,7 +248,7 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
       }}
     >
       <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 3, width: '100%' }}>
-        {['Select file', 'Analyzing', 'Pick audio', 'Submit'].map((label) => (
+        {['Select file', 'Analyzing', 'Pick audio', 'Set scope', 'Configure prompt'].map((label) => (
           <Step key={label}>
             <StepLabel>{label}</StepLabel>
           </Step>
@@ -364,9 +383,157 @@ const UploadForm: React.FC<Props> = ({ onSubmit, isSubmitting }) => {
                 setValue('scopeEnd', out);
               }}
             />
-            <Button type="submit" variant="contained" disabled={isSubmitting} sx={{ mt: 2 }}>
-              {isSubmitting ? 'Processing…' : 'Start Processing'}
+            <Button variant="contained" onClick={() => setActiveStep(4)} sx={{ mt: 2 }}>
+              Next
             </Button>
+          </>
+        )}
+
+        {activeStep === 4 && (
+          <>
+            <Typography variant="h6">Configure AI Prompt</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Customize how the AI will edit your video. Leave empty to use the default prompt.
+            </Typography>
+            
+            <FormControl fullWidth sx={{ mb: 2 }}>
+              <InputLabel>Preset Style</InputLabel>
+              <Controller
+                name="prompt"
+                control={control}
+                render={({ field }) => (
+                  <Select
+                    {...field}
+                    label="Preset Style"
+                    value={Object.keys(PRESET_PROMPTS).find(key => PRESET_PROMPTS[key as keyof typeof PRESET_PROMPTS] === field.value) || 'custom'}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (value === 'custom') {
+                        field.onChange('');
+                      } else {
+                        field.onChange(PRESET_PROMPTS[value as keyof typeof PRESET_PROMPTS]);
+                      }
+                    }}
+                  >
+                    <MenuItem value="default">Default (Comedy/Entertainment)</MenuItem>
+                    <MenuItem value="educational">Educational/Tutorial</MenuItem>
+                    <MenuItem value="gaming">Gaming Highlights</MenuItem>
+                    <MenuItem value="vlog">Vlog/Personal</MenuItem>
+                    <MenuItem value="custom">Custom (write your own)</MenuItem>
+                  </Select>
+                )}
+              />
+            </FormControl>
+
+            <Controller
+              name="prompt"
+              control={control}
+              render={({ field }) => (
+                <TextField
+                  {...field}
+                  fullWidth
+                  multiline
+                  rows={4}
+                  label="Custom Prompt"
+                  placeholder="Describe how you want the AI to edit your video..."
+                  helperText="Be specific about the style, pacing, and what moments to highlight"
+                  variant="outlined"
+                />
+              )}
+            />
+
+            <Box sx={{ mt: 3, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: 1, borderColor: 'divider' }}>
+              <Typography variant="h6" sx={{ mb: 1 }}>Advanced Options</Typography>
+              <Controller
+                name="enableVisionExtension"
+                control={control}
+                render={({ field }) => (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        {...field}
+                        checked={field.value || false}
+                        onChange={(e) => field.onChange(e.target.checked)}
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2">
+                          Enable AI Video Extension
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Use AI vision analysis to automatically extend video clips for better context. 
+                          Requires Gemini API key and may increase processing time.
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+              />
+              
+              <Controller
+                name="enableMultimodalPass2"
+                control={control}
+                render={({ field }) => (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        {...field}
+                        checked={field.value || false}
+                        onChange={(e) => field.onChange(e.target.checked)}
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2">
+                          Enable Multimodal AI Analysis
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Upload video to Google for advanced AI analysis and refinement. 
+                          Disable to skip upload and use only local processing.
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+              />
+              
+              <Controller
+                name="simpleMode"
+                control={control}
+                render={({ field }) => (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        {...field}
+                        checked={field.value || false}
+                        onChange={(e) => field.onChange(e.target.checked)}
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
+                          Simple Mode (Recommended)
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Skip all complex processing. Just concatenate selected clips based on your prompt. 
+                          Clean, fast, no quality issues.
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+              />
+            </Box>
+
+            <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
+              <Button variant="outlined" onClick={() => setActiveStep(3)}>
+                Back
+              </Button>
+              <Button type="submit" variant="contained" disabled={isSubmitting}>
+                {isSubmitting ? 'Processing…' : 'Start Processing'}
+              </Button>
+            </Stack>
           </>
         )}
       </Stack>

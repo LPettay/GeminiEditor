@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 def cut_and_concatenate(file_path, segments, output_path, audio_track=0):
     temp_dir = tempfile.mkdtemp()
     segment_files = []
-    padding_duration = 0.15  # Seconds to pad each segment's end, experiment with this value
+    padding_duration = 0.0  # Disable padding to prevent audio overlap issues
     # min_gap_between_segments is no longer needed as we don't do inter-segment adjustment here
 
     total_segments_to_process = len(segments)
@@ -61,25 +61,26 @@ def cut_and_concatenate(file_path, segments, output_path, audio_track=0):
                     logger.warning(f"Segment {i+1} still has non-positive duration ({target_cut_end_time:.2f}s). Using minimal 0.1s duration from start_time.")
                     target_cut_end_time = current_segment_start_time + 0.1 # Default to a minimal positive duration
             
-            # Create input stream. Audio track selection relies on ffmpeg's default behavior (usually main mix).
-            # The audio_track parameter of this function is NOT used for this cutting part.
-            input_ffmpeg = ffmpeg.input(file_path, ss=current_segment_start_time, to=target_cut_end_time)
-            video_stream = input_ffmpeg.video
-            audio_stream = input_ffmpeg.audio # Takes default audio track(s)
+            # Use subprocess with FFmpeg commands for proper audio track selection
+            duration = target_cut_end_time - current_segment_start_time
             
-            # 'ss' and 'to' on the input should apply to both video and audio, 
-            # so separate 'atrim' might not be strictly necessary if 'to' is precise enough.
-            # However, keeping atrim can ensure audio duration matches video if there are subtleties.
-            # For simplicity and assuming 'to' is effective for both, we can omit atrim here initially.
-            # If audio/video sync issues arise with padding, re-evaluate atrim with duration: (target_cut_end_time - current_segment_start_time)
-
-            stream = ffmpeg.output(video_stream, audio_stream,
-                                 seg_file,
-                                 vcodec='libx264', 
-                                 acodec='aac',
-                                 # preset='fast', # Optional: consider for speed
-                                 loglevel='error')
-            ffmpeg.run(stream, overwrite_output=True)
+            cmd = [
+                'ffmpeg', '-nostdin', '-y',
+                '-ss', str(current_segment_start_time),
+                '-i', file_path,
+                '-t', str(duration),
+                '-map', '0:v:0',  # Map video stream
+                '-map', '0:a:0',  # Map all audio tracks
+                '-map', '0:a:1',
+                '-map', '0:a:2',
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-loglevel', 'error',
+                seg_file
+            ]
+            
+            logger.debug(f"Extracting segment {i+1}: {current_segment_start_time:.2f}s - {target_cut_end_time:.2f}s (track {audio_track})")
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
             segment_files.append(seg_file)
 
         # Clear the progress line after the loop
@@ -195,3 +196,71 @@ def extract_audio_segment(input_video_path: str, start_time: float, end_time: fl
             except OSError as oe:
                 logger.warning(f"Could not remove partially created audio segment {output_audio_path} after error: {oe}")
         return False
+
+
+def cut_video_segment(input_video_path: str, output_video_path: str, start_time: float, end_time: float) -> subprocess.CompletedProcess:
+    """
+    Cut a single segment from a video file using ffmpeg.
+    
+    Args:
+        input_video_path: Path to the input video file
+        output_video_path: Path where the cut segment will be saved
+        start_time: Start time in seconds
+        end_time: End time in seconds
+    
+    Returns:
+        subprocess.CompletedProcess: Result of the ffmpeg command
+    """
+    duration = end_time - start_time
+    
+    logger.info(f"Cutting video segment: {start_time}s to {end_time}s (duration: {duration}s)")
+    logger.info(f"Input: {input_video_path}")
+    logger.info(f"Output: {output_video_path}")
+    
+    try:
+        # Use ffmpeg to cut the video segment
+        cmd = [
+            'ffmpeg',
+            '-i', input_video_path,
+            '-ss', str(start_time),
+            '-t', str(duration),
+            '-c', 'copy',  # Copy streams without re-encoding for speed
+            '-avoid_negative_ts', 'make_zero',
+            '-y',  # Overwrite output file
+            output_video_path
+        ]
+        
+        logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30  # 30 second timeout per clip (much shorter)
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"Successfully created video segment: {output_video_path}")
+        else:
+            logger.error(f"FFmpeg failed with return code {result.returncode}")
+            logger.error(f"FFmpeg stderr: {result.stderr}")
+            
+        return result
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"FFmpeg timed out after 30 seconds for segment {start_time}s-{end_time}s")
+        # Return a failed result
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=124,  # Timeout return code
+            stdout="",
+            stderr="FFmpeg timed out after 30 seconds"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error during video segment cutting: {str(e)}")
+        return subprocess.CompletedProcess(
+            args=cmd if 'cmd' in locals() else [],
+            returncode=1,
+            stdout="",
+            stderr=str(e)
+        )
