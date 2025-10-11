@@ -51,6 +51,8 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
   
   const preloadCacheRef = useRef<Map<number, HTMLVideoElement>>(new Map());
   const intendedPlayingRef = useRef(false); // Track if user intends video to be playing
+  const [isPrimaryActive, setIsPrimaryActive] = useState(true); // Toggle between primary and preload video
+  const lastLoadedClipRef = useRef<number>(-1); // Prevent duplicate loads
 
   const totalDuration = clips.reduce((sum, clip) => sum + clip.duration, 0);
 
@@ -65,17 +67,16 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
   // Preload buffer: Load 3 clips ahead before allowing playback
   useEffect(() => {
     if (isHlsMode || clips.length === 0) {
-      console.log('[BUFFER] Skipping buffer (HLS mode or no clips)');
       setBufferReady(true);
       setFirstClipReady(true);
       return;
     }
     
-    console.log(`[BUFFER] Preloading first 3 clips from ${clips.length} total...`);
     setFirstClipReady(false); // Reset first clip ready state
-    const BUFFER_SIZE = 3;
-    const clipsToPreload = Math.min(BUFFER_SIZE, clips.length);
+    const clipsToPreload = clips.length; // PRELOAD ALL CLIPS
     let loadedCount = 0;
+    
+    console.log(`[BUFFER] Preloading ALL ${clipsToPreload} clips...`);
     
     const preloadClip = (index: number) => {
       if (index >= clips.length) return;
@@ -85,24 +86,25 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
       video.src = clips[index].clip_url;
       
       const onCanPlay = () => {
-        console.log(`[BUFFER] Clip ${index} ready (${video.readyState}) - ${clips[index].clip_url}`);
         preloadCacheRef.current.set(index, video);
         loadedCount++;
         
         // First clip is ready immediately
         if (index === 0) {
-          console.log('[BUFFER] ✓ First clip ready for immediate playback');
           setFirstClipReady(true);
+          console.log('[BUFFER] First clip ready');
         }
         
         if (loadedCount >= clipsToPreload) {
-          console.log(`[BUFFER] ✓ Buffer ready! ${loadedCount} clips preloaded`);
           setBufferReady(true);
+          console.log(`[BUFFER] All ${loadedCount} clips preloaded!`);
+        } else if (loadedCount % 20 === 0) {
+          console.log(`[BUFFER] ${loadedCount}/${clipsToPreload} clips loaded`);
         }
       };
       
       const onError = (e: any) => {
-        console.error(`[BUFFER] Clip ${index} failed to load:`, e, clips[index].clip_url);
+        // Silent - cleanup errors are expected
       };
       
       video.addEventListener('canplaythrough', onCanPlay, { once: true });
@@ -181,61 +183,84 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
 
   // Fallback sequential mode: set src on clip/index change
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || isHlsMode) return;
+    const primaryVideo = videoRef.current;
+    const preloadVideo = preloadVideoRef.current;
+    if (!primaryVideo || !preloadVideo || isHlsMode) return;
     const current = clips[currentClipIndex];
     if (!current) return;
     
+    // Prevent duplicate loads
+    if (lastLoadedClipRef.current === currentClipIndex) {
+      console.log(`[VIDEO] Clip ${currentClipIndex} already loaded, skipping`);
+      return;
+    }
+    
     console.log(`[VIDEO] Loading clip ${currentClipIndex}:`, current.clip_url);
     
-    // Only update if different
-    const currentPath = video.src ? new URL(video.src, window.location.origin).pathname : '';
-    const nextPath = current.clip_url.startsWith('http') ? new URL(current.clip_url).pathname : current.clip_url;
-    if (currentPath !== nextPath) {
-      console.log(`[VIDEO] Setting src: ${current.clip_url}`);
-      const shouldAutoPlay = intendedPlayingRef.current; // Use ref, not video.paused
+    // Get the active and inactive video elements
+    const activeVideo = isPrimaryActive ? primaryVideo : preloadVideo;
+    const inactiveVideo = isPrimaryActive ? preloadVideo : primaryVideo;
+    
+    // Check if inactive video already has this clip loaded
+    const inactivePath = inactiveVideo.src ? new URL(inactiveVideo.src, window.location.origin).pathname : '';
+    const targetPath = current.clip_url.startsWith('http') ? new URL(current.clip_url).pathname : current.clip_url;
+    
+    if (inactivePath === targetPath) {
+      // Instant switch to preloaded clip
+      const shouldAutoPlay = intendedPlayingRef.current;
+      lastLoadedClipRef.current = currentClipIndex;
       
-      setIsLoadingClip(true); // Show loading indicator
-      video.src = current.clip_url;
-      video.currentTime = 0;
-      video.load(); // This will reset readyState to 0
+      // Swap active video
+      setIsPrimaryActive(!isPrimaryActive);
       
-      // Wait for frames to be decoded before continuing
-      const onLoadedData = () => {
-        console.log('[VIDEO] Loaded data, readyState:', video.readyState);
+      // Play if needed
+      if (shouldAutoPlay) {
+        inactiveVideo.currentTime = 0;
+        inactiveVideo.play().then(() => setIsPlaying(true));
         
-        // Force a frame decode by seeking to 0
-        video.currentTime = 0;
-        
-        // Wait for the seek/decode to complete
-        requestAnimationFrame(() => {
-          setIsLoadingClip(false); // Hide loading indicator
-          
-          // If video was playing, resume playback
-          if (shouldAutoPlay) {
-            console.log('[VIDEO] Auto-playing now');
-            video.play()
-              .then(() => {
-                console.log('[VIDEO] Resume successful');
-                setIsPlaying(true);
-              })
-              .catch((e) => console.error('[VIDEO] Resume play failed:', e));
-          }
-        });
-      };
-      
-      // Check if already has decoded frames
-      if (video.readyState >= 2) {
-        console.log('[VIDEO] Already has data');
-        onLoadedData();
-      } else {
-        console.log('[VIDEO] Waiting for loadeddata event');
-        video.addEventListener('loadeddata', onLoadedData, { once: true });
+        // Preload next clip
+        const nextIndex = currentClipIndex + 1;
+        if (nextIndex < clips.length) {
+          activeVideo.src = clips[nextIndex].clip_url;
+          activeVideo.currentTime = 0;
+          activeVideo.load();
+        }
       }
       
       onClipChange?.(currentClipIndex);
+    } else {
+      // Load into active video
+      const activePath = activeVideo.src ? new URL(activeVideo.src, window.location.origin).pathname : '';
+      if (activePath !== targetPath) {
+        const shouldAutoPlay = intendedPlayingRef.current;
+        lastLoadedClipRef.current = currentClipIndex;
+        
+        setIsLoadingClip(true);
+        activeVideo.src = current.clip_url;
+        activeVideo.load();
+        
+        const onCanPlay = () => {
+          setIsLoadingClip(false);
+          
+          if (shouldAutoPlay) {
+            activeVideo.play().then(() => setIsPlaying(true));
+            
+            // Preload next clip
+            const nextIndex = currentClipIndex + 1;
+            if (nextIndex < clips.length) {
+              const inactiveVideo = isPrimaryActive ? preloadVideo : primaryVideo;
+              inactiveVideo.src = clips[nextIndex].clip_url;
+              inactiveVideo.currentTime = 0;
+              inactiveVideo.load();
+            }
+          }
+        };
+        
+        activeVideo.addEventListener('canplay', onCanPlay, { once: true });
+        onClipChange?.(currentClipIndex);
+      }
     }
-  }, [isHlsMode, clips, currentClipIndex]);
+  }, [isHlsMode, clips, currentClipIndex, isPrimaryActive]);
 
   // Handle video end
   const handleVideoEnd = () => {
@@ -258,11 +283,6 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     const localTime = video.currentTime;
-    
-    // Log every second to track playback
-    if (Math.floor(localTime) !== Math.floor(currentTime)) {
-      console.log(`[TIME] Clip ${currentClipIndex} playing at ${localTime.toFixed(2)}s, readyState: ${video.readyState}, paused: ${video.paused}`);
-    }
 
     if (isHlsMode) {
       // HLS mode: time is already global
@@ -298,7 +318,6 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
             video.preload = 'auto';
             video.src = clips[targetIndex].clip_url;
             video.addEventListener('canplaythrough', () => {
-              console.log(`[BUFFER] Clip ${targetIndex} ready`);
               preloadCacheRef.current.set(targetIndex, video);
             }, { once: true });
             video.load();
@@ -308,12 +327,10 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
         // Clean up old clips (more than 2 behind current)
         preloadCacheRef.current.forEach((video, index) => {
           if (index < currentClipIndex - 2) {
-            // Remove all event listeners before cleanup to prevent error events
             video.oncanplaythrough = null;
             video.onerror = null;
             video.src = '';
             preloadCacheRef.current.delete(index);
-            console.log(`[BUFFER] Cleaned up clip ${index}`);
           }
         });
       }
@@ -330,55 +347,19 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
 
   // Play/Pause
   const togglePlayPause = () => {
-    const video = videoRef.current;
-    if (!video || !firstClipReady) {
-      console.log('[PLAY] First clip not ready yet, please wait...');
-      return;
-    }
-    console.log('[PLAY] Toggle called, isPlaying:', isPlaying, 'readyState:', video.readyState, 'paused:', video.paused, 'src:', video.src);
+    const primaryVideo = videoRef.current;
+    const preloadVideo = preloadVideoRef.current;
+    const video = isPrimaryActive ? primaryVideo : preloadVideo;
+    
+    if (!video || !firstClipReady) return;
+    
     if (isPlaying) {
       video.pause();
       setIsPlaying(false);
       intendedPlayingRef.current = false;
     } else {
-      console.log('[PLAY] Attempting play... readyState:', video.readyState);
       intendedPlayingRef.current = true;
-      
-      // Wait for at least the first frame to be decoded
-      const attemptPlay = () => {
-        console.log('[PLAY] Starting playback, readyState:', video.readyState);
-        
-        // Force a frame to be decoded by seeking to current position
-        // This ensures the GPU has decoded at least one frame
-        const currentPos = video.currentTime;
-        video.currentTime = currentPos;
-        
-        // Wait a tiny bit for the seek to complete and frame to decode
-        requestAnimationFrame(() => {
-          video.play()
-            .then(() => {
-              console.log('[PLAY] Play successful');
-              setIsPlaying(true);
-            })
-            .catch((err) => {
-              console.error('[PLAY] Play failed:', err);
-            });
-        });
-      };
-      
-      // If video has decoded frames, play immediately
-      // Otherwise wait for loadeddata (at least current frame decoded)
-      if (video.readyState >= 2) {
-        console.log('[PLAY] Video has data, playing immediately');
-        attemptPlay();
-      } else {
-        console.log('[PLAY] Video not ready, waiting for loadeddata event...');
-        const onLoadedData = () => {
-          console.log('[PLAY] Loaded data event fired');
-          attemptPlay();
-        };
-        video.addEventListener('loadeddata', onLoadedData, { once: true });
-      }
+      video.play().then(() => setIsPlaying(true));
     }
   };
 
@@ -537,14 +518,14 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
         </Box>
       )}
       
-      {/* Video Element */}
+      {/* Primary Video Element */}
       <video
         ref={videoRef}
         preload="auto"
         style={{
           width: '100%',
           height: '100%',
-          display: 'block',
+          display: isPrimaryActive ? 'block' : 'none',
           objectFit: 'contain',
           backgroundColor: 'black',
         }}
@@ -552,19 +533,23 @@ const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onClick={togglePlayPause}
-        onPause={(e) => {
-          console.log('[VIDEO EVENT] pause event fired, readyState:', e.currentTarget.readyState);
-        }}
-        onPlay={(e) => {
-          console.log('[VIDEO EVENT] play event fired, readyState:', e.currentTarget.readyState);
-        }}
       />
       
-      {/* Hidden preload video for next clip */}
+      {/* Preload/Secondary Video Element */}
       <video
         ref={preloadVideoRef}
-        style={{ display: 'none' }}
         preload="auto"
+        style={{
+          width: '100%',
+          height: '100%',
+          display: isPrimaryActive ? 'none' : 'block',
+          objectFit: 'contain',
+          backgroundColor: 'black',
+        }}
+        onEnded={handleVideoEnd}
+        onTimeUpdate={handleTimeUpdate}
+        onLoadedMetadata={handleLoadedMetadata}
+        onClick={togglePlayPause}
       />
 
       {/* Controls Overlay */}
