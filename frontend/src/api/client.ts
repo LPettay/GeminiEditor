@@ -233,6 +233,22 @@ class ApiClient {
     return response.data;
   }
 
+  async getPersistedClips(projectId: string, videoId: string): Promise<{ clips: ClipPreview[] }> {
+    const response = await this.client.get(`/api/projects/${projectId}/source-videos/${videoId}/clips`);
+    const data = response.data;
+    // Normalize shape to ClipPreview
+    const clips: ClipPreview[] = (data.clips || []).map((c: any) => ({
+      decision_id: c.segment_id || c.id,
+      clip_url: c.stream_url,
+      start_time: c.start_time,
+      end_time: c.end_time,
+      duration: c.duration,
+      transcript_text: c.transcript_text || '',
+      order_index: c.order_index ?? 0,
+    }));
+    return { clips };
+  }
+
   getClipStreamUrl(projectId: string, clipId: string): string {
     return `/api/projects/${projectId}/clips/${clipId}/play`;
   }
@@ -407,6 +423,37 @@ class ApiClient {
 
   getDownloadUrl(projectId: string, editId: string): string {
     return `/api/projects/${projectId}/edits/${editId}/download`;
+  }
+
+  // ==================== Unified EDL HLS ====================
+
+  async buildEdlStream(projectId: string, editId: string): Promise<{ success: boolean; edl_hash?: string; message?: string }> {
+    const response = await this.client.post(`/api/projects/${projectId}/edits/${editId}/edl/build`);
+    return response.data;
+  }
+
+  async getEdlStatus(projectId: string, editId: string): Promise<{ status: string; edl_hash?: string }> {
+    const response = await this.client.get(`/api/projects/${projectId}/edits/${editId}/edl/status`);
+    return response.data;
+  }
+
+  getEdlManifestUrl(projectId: string, editId: string): string {
+    return `/api/projects/${projectId}/edits/${editId}/edl/manifest.m3u8`;
+  }
+
+  // Source video unified stream
+  async buildSourceVideoEdl(projectId: string, videoId: string): Promise<{ status: string; message?: string }> {
+    const response = await this.client.post(`/api/projects/${projectId}/source-videos/${videoId}/edl/build`);
+    return response.data;
+  }
+
+  async getSourceVideoEdlStatus(projectId: string, videoId: string): Promise<{ status: string; edl_hash?: string }> {
+    const response = await this.client.get(`/api/projects/${projectId}/source-videos/${videoId}/edl/status`);
+    return response.data;
+  }
+
+  getSourceVideoEdlManifestUrl(projectId: string, videoId: string): string {
+    return `/api/projects/${projectId}/source-videos/${videoId}/edl/manifest.m3u8`;
   }
 
 }

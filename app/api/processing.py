@@ -3,8 +3,11 @@ API routes for video processing, preview, and finalization.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional
+from pathlib import Path
+import json
 import asyncio
 import uuid
 import os
@@ -613,7 +616,7 @@ async def _segment_video_background(job_id: str, video_id: str, video_path: str,
         
         if result.success:
             logger.info(f"Segmentation completed successfully with {len(result.clips)} clips")
-            
+
             # Store clip metadata for streaming
             for clip in result.clips:
                 video_clips_store[clip.id] = {
@@ -623,9 +626,32 @@ async def _segment_video_background(job_id: str, video_id: str, video_path: str,
                     "end_time": clip.end_time,
                     "duration": clip.duration,
                     "segment_id": clip.segment_id,
-                    "file_path": clip.file_path
+                    "file_path": clip.file_path,
                 }
-            
+
+            # Persist index to disk for reuse
+            try:
+                clips_dir = Path("clips") / video_id
+                clips_dir.mkdir(parents=True, exist_ok=True)
+                index_path = clips_dir / "index.json"
+                persisted = [
+                    {
+                        "id": clip.id,
+                        "segment_id": clip.segment_id,
+                        "start_time": clip.start_time,
+                        "end_time": clip.end_time,
+                        "duration": clip.duration,
+                        "order_index": clip.order_index,
+                        "file_path": clip.file_path,
+                    }
+                    for clip in result.clips
+                ]
+                with open(index_path, "w", encoding="utf-8") as f:
+                    json.dump({"clips": persisted}, f)
+                logger.info(f"Persisted clip index: {index_path}")
+            except Exception as persist_err:
+                logger.warning(f"Failed to persist clip index: {persist_err}")
+
             # Update job status with success
             segmentation_jobs[job_id] = {
                 "status": "completed",
@@ -642,10 +668,10 @@ async def _segment_video_background(job_id: str, video_id: str, video_path: str,
                         "end_time": clip.end_time,
                         "duration": clip.duration,
                         "order_index": clip.order_index,
-                        "stream_url": f"/api/projects/{project_id}/clips/{clip.id}/play"
+                        "stream_url": f"/api/projects/{project_id}/clips/{clip.id}/play",
                     }
                     for clip in result.clips
-                ]
+                ],
             }
             logger.info(f"Updated job status for {job_id}: {segmentation_jobs[job_id]['status']}")
         else:
@@ -700,46 +726,51 @@ def stream_clip(project_id: str, clip_id: str, request: Request, db: Session = D
     
     try:
         # Get clip metadata from store
-        if clip_id not in video_clips_store:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Clip {clip_id} not found"
-            )
-        
-        clip_metadata = video_clips_store[clip_id]
-        
-        # Verify the clip belongs to this project
-        if clip_metadata["project_id"] != project_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Clip does not belong to this project"
-            )
-        
-        # Get the source video
-        source_video = SourceVideoDAO.get_by_id(db, clip_metadata["source_video_id"])
-        if not source_video:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Source video not found"
-            )
-        
-        # Check if clip file exists (if we're using actual clip files)
-        if os.path.exists(clip_metadata["file_path"]):
-            # Stream the actual clip file
-            return stream_video_file(
-                clip_metadata["file_path"],
-                f"clip_{clip_id}.mp4",
-                request
-            )
-        else:
-            # For now, stream the full original video
-            # The frontend LivePreviewPlayer will handle time-based seeking
-            # This is simpler and more performant than server-side time range streaming
-            return stream_video_file(
-                source_video.file_path,
-                source_video.filename,
-                request
-            )
+        clip_metadata = None
+        if clip_id in video_clips_store:
+            clip_metadata = video_clips_store[clip_id]
+            # Verify project by comparing stored project_id
+            if clip_metadata.get("project_id") != project_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Clip does not belong to this project")
+            source_video = SourceVideoDAO.get_by_id(db, clip_metadata["source_video_id"])
+            if not source_video:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source video not found")
+            if os.path.exists(clip_metadata["file_path"]):
+                return stream_video_file(clip_metadata["file_path"], f"clip_{clip_id}.mp4", request)
+            else:
+                return stream_video_file(source_video.file_path, source_video.filename, request)
+
+        # Fallback: look up persisted clips on disk (survives restarts)
+        clips_root = Path("clips")
+        if clips_root.exists():
+            for video_dir in clips_root.iterdir():
+                if not video_dir.is_dir():
+                    continue
+                index_path = video_dir / "index.json"
+                if not index_path.exists():
+                    continue
+                try:
+                    with open(index_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    for c in data.get("clips", []):
+                        if c.get("id") == clip_id:
+                            source_video_id = video_dir.name
+                            source_video = SourceVideoDAO.get_by_id(db, source_video_id)
+                            if not source_video:
+                                continue
+                            # Ensure the video belongs to requested project
+                            if source_video.project_id != project_id:
+                                continue
+                            file_path = c.get("file_path")
+                            if file_path and os.path.exists(file_path):
+                                return stream_video_file(file_path, f"clip_{clip_id}.mp4", request)
+                            # If file is missing, fall back to full source
+                            return stream_video_file(source_video.file_path, source_video.filename, request)
+                except Exception as _e:
+                    continue
+
+        # If still not found
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Clip {clip_id} not found")
             
     except HTTPException:
         raise
@@ -750,3 +781,218 @@ def stream_clip(project_id: str, clip_id: str, request: Request, db: Session = D
             detail=f"Failed to stream clip: {str(e)}"
         )
 
+
+@router.get("/api/projects/{project_id}/source-videos/{video_id}/clips")
+def list_persisted_clips(project_id: str, video_id: str):
+    """Return persisted clips for a source video if available (no re-segmentation required)."""
+    try:
+        index_path = Path("clips") / video_id / "index.json"
+        if not index_path.exists():
+            return {"clips": []}
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        clips = data.get("clips", [])
+        # Attach stream_url for each clip
+        enriched = [
+            {
+                **clip,
+                "stream_url": f"/api/projects/{project_id}/clips/{clip['id']}/play",
+            }
+            for clip in clips
+        ]
+        return {"clips": enriched}
+    except Exception as e:
+        logger.error(f"Error reading persisted clips: {e}")
+        return {"clips": []}
+
+
+@router.post("/api/projects/{project_id}/source-videos/{video_id}/edl/build")
+async def build_source_video_edl(project_id: str, video_id: str, background_tasks: BackgroundTasks):
+    """Build unified HLS for source video from persisted clips."""
+    background_tasks.add_task(_build_source_video_edl_background_sync, project_id, video_id)
+    return {"status": "building", "message": "Started unified stream build"}
+
+
+def _build_source_video_edl_background_sync(project_id: str, video_id: str):
+    """Synchronous wrapper for background task."""
+    import asyncio
+    asyncio.run(_build_source_video_edl_background_async(project_id, video_id))
+
+
+async def _build_source_video_edl_background_async(project_id: str, video_id: str):
+    """Background task to build unified stream from persisted clips."""
+    from app.services.edl_stream_service import build_unified_hls_from_ranges
+    logger.info(f"[SRC EDL BG] Starting background build for video {video_id}")
+    try:
+        index_path = Path("clips") / video_id / "index.json"
+        if not index_path.exists():
+            logger.error(f"[SRC EDL BG] No clips index for video {video_id}")
+            return
+        
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        clips = data.get("clips", [])
+        if not clips:
+            logger.warning(f"[SRC EDL BG] No clips in index for {video_id}")
+            return
+        
+        logger.info(f"[SRC EDL BG] Found {len(clips)} clips in index")
+        
+        # Get source video path
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            src = SourceVideoDAO.get_by_id(db, video_id)
+            if not src:
+                logger.error(f"[SRC EDL BG] Source video not found: {video_id}")
+                return
+            
+            logger.info(f"[SRC EDL BG] Source video path: {src.file_path}")
+            ranges = [(float(c["start_time"]), float(c["end_time"])) for c in clips]
+            result = await build_unified_hls_from_ranges(video_id, src.file_path, ranges)
+            logger.info(f"[SRC EDL BG] Build result: success={result.success}, message={result.message}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[SRC EDL BG] Build failed: {e}", exc_info=True)
+
+
+@router.get("/api/projects/{project_id}/source-videos/{video_id}/edl/status")
+def get_source_video_edl_status(project_id: str, video_id: str):
+    """Get unified stream status for source video."""
+    from app.services.edl_stream_service import _compute_edl_hash, _status_path
+    try:
+        index_path = Path("clips") / video_id / "index.json"
+        if not index_path.exists():
+            return {"status": "missing"}
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        clips = data.get("clips", [])
+        if not clips:
+            return {"status": "missing"}
+        
+        ranges = [(float(c["start_time"]), float(c["end_time"])) for c in clips]
+        edl_hash = _compute_edl_hash(video_id, ranges)
+        status_path = _status_path(edl_hash)
+        if not status_path.exists():
+            return {"status": "missing", "edl_hash": edl_hash}
+        
+        try:
+            st = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception:
+            st = {"status": "missing"}
+        st["edl_hash"] = edl_hash
+        return st
+    except Exception as e:
+        logger.error(f"[SRC EDL] Status check failed: {e}")
+        return {"status": "error"}
+
+
+@router.get("/api/projects/{project_id}/source-videos/{video_id}/edl/manifest.m3u8")
+def get_source_video_edl_manifest(project_id: str, video_id: str):
+    """Serve unified manifest for source video."""
+    from app.services.edl_stream_service import _compute_edl_hash, _manifest_path, EDL_ROOT
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info(f"[SRC EDL MANIFEST] Request for video={video_id}")
+        index_path = Path("clips") / video_id / "index.json"
+        if not index_path.exists():
+            logger.error(f"[SRC EDL MANIFEST] No clips index at {index_path}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No clips")
+        
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        clips = data.get("clips", [])
+        if not clips:
+            logger.error(f"[SRC EDL MANIFEST] No clips in index")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No clips")
+        
+        ranges = [(float(c["start_time"]), float(c["end_time"])) for c in clips]
+        edl_hash = _compute_edl_hash(video_id, ranges)
+        logger.info(f"[SRC EDL MANIFEST] Hash: {edl_hash}")
+        
+        manifest_path = _manifest_path(edl_hash)
+        logger.info(f"[SRC EDL MANIFEST] Looking for manifest at {manifest_path}")
+        
+        if not manifest_path.exists():
+            logger.error(f"[SRC EDL MANIFEST] Manifest not found at {manifest_path}")
+            # List what's actually in the directory
+            edl_dir = EDL_ROOT / edl_hash
+            if edl_dir.exists():
+                files = list(edl_dir.iterdir())
+                logger.info(f"[SRC EDL MANIFEST] Directory contents: {[f.name for f in files]}")
+            else:
+                logger.error(f"[SRC EDL MANIFEST] Directory doesn't exist: {edl_dir}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manifest not ready")
+        
+        logger.info(f"[SRC EDL MANIFEST] Serving manifest from {manifest_path}")
+        
+        # Rewrite segment URIs to include edl_hash in the path
+        try:
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+        except Exception as read_err:
+            logger.error(f"[SRC EDL MANIFEST] Could not read manifest: {read_err}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not read manifest")
+        
+        # Rewrite init and segment paths to routed endpoints
+        from fastapi.responses import Response
+        prefix = f"/api/projects/{project_id}/source-videos/{video_id}/edl/{edl_hash}/"
+        out_lines = []
+        for raw_line in manifest_text.splitlines():
+            line = raw_line.strip()
+            if 'URI=' in line and 'init.mp4' in line:
+                # Rewrite init URI
+                out_lines.append(f'#EXT-X-MAP:URI="{prefix}init.mp4"')
+            elif line and not line.startswith('#'):
+                # Segment filename like seg-00001.m4s
+                out_lines.append(prefix + line)
+            else:
+                out_lines.append(raw_line)
+        
+        rewritten = "\n".join(out_lines) + "\n"
+        logger.info(f"[SRC EDL MANIFEST] Rewritten manifest with prefix {prefix}")
+        
+        return Response(
+            content=rewritten,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "public, max-age=60",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[SRC EDL MANIFEST] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.get("/api/projects/{project_id}/source-videos/{video_id}/edl/{edl_hash}/{segment_name}")
+def get_source_video_edl_segment(project_id: str, video_id: str, edl_hash: str, segment_name: str):
+    """Serve init.mp4 and segments for source video unified stream."""
+    from app.services.edl_stream_service import EDL_ROOT
+    
+    base_dir = EDL_ROOT / edl_hash
+    file_path = base_dir / segment_name
+    
+    if not file_path.exists():
+        logger.error(f"[SRC EDL SEG] Segment not found: {file_path}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    
+    if segment_name.endswith('.m4s'):
+        media_type = 'video/iso.segment'
+    elif segment_name.endswith('.mp4'):
+        media_type = 'video/mp4'
+    else:
+        media_type = 'application/octet-stream'
+    
+    return FileResponse(
+        str(file_path),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )

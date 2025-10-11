@@ -5,6 +5,7 @@ Handles operations related to edit versions and edit decision lists.
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response, FileResponse
+import json
 from typing import List
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ from app.schemas import (
 )
 from app.services.hls_service import build_playlist_content, ensure_cmaf_for_decision
 from app.dao import EditDecisionDAO, SourceVideoDAO
+from app.services.edl_stream_service import build_unified_hls_for_edit
 
 router = APIRouter(prefix="/api/projects/{project_id}/edits", tags=["edits"])
 
@@ -148,71 +150,127 @@ def delete_edit(project_id: str, edit_id: str, db: Session = Depends(get_db)):
     return None
 
 
-# ==================== HLS PREVIEW (VOD) ====================
+# ==================== UNIFIED EDL STREAM ====================
 
-@router.get("/{edit_id}/playlist.m3u8")
-def get_hls_playlist(project_id: str, edit_id: str, db: Session = Depends(get_db)):
-    """
-    Generate an HLS VOD playlist for the edit's current EDL order.
-    Each entry maps to a single fMP4 segment built from the source video.
-    """
-    edit = EditDAO.get_with_decisions(db, edit_id)
-    if not edit or edit.project_id != project_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Edit not found")
-
-    # Get included decisions in order
-    decisions = [d for d in edit.edit_decisions if d.is_included]
-    decisions.sort(key=lambda d: d.order_index)
-
-    # Ensure CMAF exists for each decision (idempotent)
-    source_video = SourceVideoDAO.get_by_id(db, edit.source_video_id)
-    if not source_video:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Source video not found")
-
-    items = []
-    for d in decisions:
-        # Build/init on demand for newly created videos
-        ensure_cmaf_for_decision(
-            edit_id=edit_id,
-            decision_id=d.id,
-            source_video_path=source_video.file_path,
-            start_time=float(d.start_time),
-            end_time=float(d.end_time),
-        )
-        items.append((d.id, float(max(0.01, d.end_time - d.start_time))))
-
-    playlist = build_playlist_content(project_id, edit_id, items)
-    return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
+@router.post("/{edit_id}/edl/build")
+async def edl_build(project_id: str, edit_id: str):
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[EDL API] Build request: project={project_id}, edit={edit_id}")
+    result = await build_unified_hls_for_edit(project_id, edit_id)
+    logger.info(f"[EDL API] Build result: success={result.success}, hash={result.edl_hash}, msg={result.message}")
+    status_code = 200 if result.success else 202 if result.edl_hash else 500
+    return Response(
+        content=json.dumps({
+            "success": result.success,
+            "edl_hash": result.edl_hash,
+            "message": result.message,
+        }),
+        media_type="application/json",
+        status_code=status_code,
+    )
 
 
-@router.get("/{edit_id}/segments/{segment_name}")
-def get_hls_segment(project_id: str, edit_id: str, segment_name: str):
-    """
-    Serve init (.init.mp4) or media (.m4s) file for a decision.
-    """
-    base_dir = Path("tmp") / "hls" / edit_id / "segments"
+@router.get("/{edit_id}/edl/status")
+def edl_status(project_id: str, edit_id: str):
+    from app.services.edl_stream_service import _compute_edl_hash, _status_path
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        edit = EditDecisionDAO  # placeholder to keep import; real logic below
+        from app.dao import EditDAO
+        edit_obj = EditDAO.get_with_decisions(db, edit_id)
+        if not edit_obj or edit_obj.project_id != project_id:
+            return {"status": "missing"}
+        decisions = [d for d in edit_obj.edit_decisions if d.is_included]
+        decisions.sort(key=lambda d: d.order_index)
+        if not decisions:
+            return {"status": "missing"}
+        ranges = [(float(d.start_time), float(d.end_time)) for d in decisions]
+        edl_hash = _compute_edl_hash(edit_obj.source_video_id, ranges)
+        status_path = _status_path(edl_hash)
+        if not status_path.exists():
+            return {"status": "missing", "edl_hash": edl_hash}
+        try:
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"status": "missing"}
+        data["edl_hash"] = edl_hash
+        return data
+    finally:
+        db.close()
+
+
+@router.get("/{edit_id}/edl/manifest.m3u8")
+def edl_manifest(project_id: str, edit_id: str):
+    from app.services.edl_stream_service import _compute_edl_hash, _manifest_path
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        from app.dao import EditDAO
+        edit_obj = EditDAO.get_with_decisions(db, edit_id)
+        if not edit_obj or edit_obj.project_id != project_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Edit not found")
+        decisions = [d for d in edit_obj.edit_decisions if d.is_included]
+        decisions.sort(key=lambda d: d.order_index)
+        if not decisions:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No EDL")
+        ranges = [(float(d.start_time), float(d.end_time)) for d in decisions]
+        edl_hash = _compute_edl_hash(edit_obj.source_video_id, ranges)
+        manifest_path = _manifest_path(edl_hash)
+        if not manifest_path.exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manifest not ready")
+        # Rewrite segment URIs to routed API endpoints
+        try:
+            text = manifest_path.read_text(encoding="utf-8")
+        except Exception:
+            return FileResponse(str(manifest_path), media_type="application/vnd.apple.mpegurl")
+
+        prefix = f"/api/projects/{project_id}/edits/{edit_id}/edl/{edl_hash}/"
+        out_lines = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith('#EXT-X-MAP:') and 'URI=' in line:
+                # Replace init URI
+                out_lines.append(f'#EXT-X-MAP:URI="{prefix}init.mp4"')
+            elif line and not line.startswith('#'):
+                # segment line like seg-00001.m4s
+                out_lines.append(prefix + line)
+            else:
+                out_lines.append(raw)
+
+        out_text = "\n".join(out_lines) + "\n"
+        headers = {
+            "Cache-Control": "public, max-age=60",
+            "Access-Control-Allow-Origin": "*",
+        }
+        return Response(content=out_text, media_type="application/vnd.apple.mpegurl", headers=headers)
+    finally:
+        db.close()
+
+
+@router.get("/{edit_id}/edl/{edl_hash}/{segment_name}")
+def edl_segment(project_id: str, edit_id: str, edl_hash: str, segment_name: str):
+    """Serve unified EDL init.mp4 and segments."""
+    base_dir = Path("tmp") / "edl" / edl_hash
     file_path = base_dir / segment_name
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
 
-    # Set appropriate MIME based on extension
-    if segment_name.endswith(".init") or segment_name.endswith(".init.mp4"):
-        media_type = "video/mp4"
-    elif segment_name.endswith(".m4s"):
-        media_type = "video/iso.segment"
+    if segment_name.endswith('.m4s'):
+        media_type = 'video/iso.segment'
+    elif segment_name.endswith('.mp4'):
+        media_type = 'video/mp4'
+    elif segment_name.endswith('.m3u8'):
+        media_type = 'application/vnd.apple.mpegurl'
     else:
-        media_type = "application/octet-stream"
+        media_type = 'application/octet-stream'
 
-    # CORS/cache headers suitable for segments
     headers = {
         "Cache-Control": "public, max-age=31536000, immutable",
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD",
-        "Access-Control-Allow-Headers": "Range",
     }
-
     return FileResponse(str(file_path), media_type=media_type, headers=headers)
-
 
 # ==================== EDIT DECISION ROUTES ====================
 

@@ -80,6 +80,8 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [editingMode, setEditingMode] = useState<'view' | 'edit'>('view');
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
+  const [unifiedReady, setUnifiedReady] = useState(false);
+  const [unifiedManifestUrl, setUnifiedManifestUrl] = useState<string | undefined>(undefined);
   
   const videoPlayerRef = useRef<any>(null);
   const syncServiceRef = useRef<TranscriptSyncService>(new TranscriptSyncService());
@@ -287,6 +289,39 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     loadExistingTranscript();
   }, [videoId]);
 
+  // Try to load persisted clips on mount/video change
+  useEffect(() => {
+    (async () => {
+      try {
+        const { clips } = await apiClient.getPersistedClips(projectId, videoId);
+        if (clips && clips.length > 0) {
+          console.log('[CLIPS] Loaded', clips.length, 'persisted clips');
+          // Convert to player VideoClip shape used elsewhere in this component
+          const normalized = clips.map((c, idx) => ({
+            id: c.decision_id,
+            segment_id: c.decision_id,
+            start_time: c.start_time,
+            end_time: c.end_time,
+            duration: c.duration,
+            order_index: c.order_index ?? idx,
+            stream_url: c.clip_url,
+          }));
+          setVideoClips(normalized);
+          setEditingMode('edit');
+        }
+      } catch (e) {
+        console.error('[CLIPS] Load failed:', e);
+      }
+    })();
+  }, [projectId, videoId]);
+
+  // Unified HLS disabled for editing - use sequential playback for instant reordering
+  // Unified stream should only be built for final export/publish
+  useEffect(() => {
+    // Intentionally disabled - editing mode uses sequential clips for instant updates
+    console.log('[EDIT MODE] Using sequential playback for instant clip reordering');
+  }, [projectId, videoId]);
+
   // Poll for processing job progress
   useEffect(() => {
     // Clear any existing interval first
@@ -466,6 +501,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
     
     setVideoClips(reorderedClips);
     console.log('Segments reordered, updated video clips:', reorderedClips.length);
+    // Player will automatically reflect the new order via the clips prop
   };
 
   const handleSegmentVideo = (segment: SyncSegment) => {
@@ -559,7 +595,6 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
                     transcript_text: '',
                     order_index: c.order_index,
                   }))}
-                  projectId={projectId}
                   onTimeUpdate={handleTimeUpdate}
                   onClipChange={handleClipChange}
                 />

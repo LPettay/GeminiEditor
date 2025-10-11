@@ -4,7 +4,7 @@
 
 import { useRef, useState, useEffect } from 'react';
 import Hls from 'hls.js';
-import { Box, IconButton, Slider, Typography, Paper } from '@mui/material';
+import { Box, IconButton, Slider, Typography, Paper, LinearProgress } from '@mui/material';
 import {
   PlayArrow as PlayIcon,
   Pause as PauseIcon,
@@ -20,6 +20,7 @@ interface SequentialVideoPlayerProps {
   onClipChange?: (clipIndex: number) => void;
   projectId?: string;
   editId?: string;
+  hlsManifestUrl?: string; // Optional unified EDL manifest override
 }
 
 export default function SequentialVideoPlayer({
@@ -28,10 +29,13 @@ export default function SequentialVideoPlayer({
   onClipChange,
   projectId,
   editId,
+  hlsManifestUrl,
 }: SequentialVideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const preloadVideoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const prefetchedNextRef = useRef<string | null>(null);
   
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -40,6 +44,9 @@ export default function SequentialVideoPlayer({
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [bufferReady, setBufferReady] = useState(false);
+  
+  const preloadCacheRef = useRef<Map<number, HTMLVideoElement>>(new Map());
 
   const totalDuration = clips.reduce((sum, clip) => sum + clip.duration, 0);
 
@@ -48,14 +55,58 @@ export default function SequentialVideoPlayer({
 
   // For HLS playlist, video.currentTime is already global timeline time
 
-  const isHlsMode = Boolean(projectId && editId);
+  const usingUnifiedHls = Boolean(hlsManifestUrl);
+  const isHlsMode = usingUnifiedHls;
+  
+  // Preload buffer: Load 3 clips ahead before allowing playback
+  useEffect(() => {
+    if (isHlsMode || clips.length === 0) {
+      setBufferReady(true);
+      return;
+    }
+    
+    console.log('[BUFFER] Preloading first 3 clips...');
+    const BUFFER_SIZE = 3;
+    const clipsToPreload = Math.min(BUFFER_SIZE, clips.length);
+    let loadedCount = 0;
+    
+    const preloadClip = (index: number) => {
+      if (index >= clips.length) return;
+      
+      const video = document.createElement('video');
+      video.preload = 'auto';
+      video.src = clips[index].clip_url;
+      
+      const onCanPlay = () => {
+        console.log(`[BUFFER] Clip ${index} ready (${video.readyState})`);
+        preloadCacheRef.current.set(index, video);
+        loadedCount++;
+        
+        if (loadedCount >= clipsToPreload) {
+          console.log(`[BUFFER] ✓ Buffer ready! ${loadedCount} clips preloaded`);
+          setBufferReady(true);
+        }
+      };
+      
+      video.addEventListener('canplaythrough', onCanPlay, { once: true });
+      video.load();
+    };
+    
+    for (let i = 0; i < clipsToPreload; i++) {
+      preloadClip(i);
+    }
+    
+    // Cleanup
+    return () => {
+      preloadCacheRef.current.forEach(v => v.src = '');
+      preloadCacheRef.current.clear();
+    };
+  }, [clips, isHlsMode]);
 
-  // Initialize HLS once and whenever project/edit changes or EDL order changes
+  // Initialize HLS once when unified manifest is available
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !isHlsMode) return;
-
-    const playlistUrl = `/api/projects/${projectId}/edits/${editId}/playlist.m3u8?t=${Date.now()}`;
+    if (!video || !hlsManifestUrl) return;
 
     // Cleanup existing instance
     if (hlsRef.current) {
@@ -67,29 +118,39 @@ export default function SequentialVideoPlayer({
       const hls = new Hls({
         autoStartLoad: true,
         lowLatencyMode: false,
-        backBufferLength: 0,
-        maxBufferLength: 30,
+        backBufferLength: 2,
+        maxBufferLength: 18,
+        maxMaxBufferLength: 24,
+        maxBufferHole: 0.1,
       });
       hlsRef.current = hls;
       hls.attachMedia(video);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        hls.loadSource(playlistUrl);
+        console.log('[HLS] Loading unified manifest:', hlsManifestUrl);
+        hls.loadSource(hlsManifestUrl);
       });
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (isPlaying) video.play().catch(() => {});
+        console.log('[HLS] Manifest parsed, duration:', video.duration);
+      });
+      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+        console.log('[HLS] Fragment loaded:', data.frag.sn, 'time:', data.frag.start.toFixed(2), 'dur:', data.frag.duration.toFixed(2));
+      });
+      hls.on(Hls.Events.BUFFER_APPENDED, () => {
+        if (video.buffered.length > 0) {
+          console.log('[HLS] Buffer:', video.buffered.start(0).toFixed(2), '-', video.buffered.end(0).toFixed(2), 'readyState:', video.readyState);
+        }
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
-        // Swallow recoverable errors; log fatal
         if (data.fatal) {
-          console.error('hls.js fatal error', data);
+          console.error('[HLS] Fatal error:', data);
+        } else {
+          console.warn('[HLS] Recoverable error:', data.details);
         }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari
-      video.src = playlistUrl;
-      video.addEventListener('loadedmetadata', () => {
-        if (isPlaying) video.play().catch(() => {});
-      }, { once: true });
+      // Safari native HLS
+      console.log('[HLS] Safari native mode:', hlsManifestUrl);
+      video.src = hlsManifestUrl;
     }
 
     return () => {
@@ -98,7 +159,7 @@ export default function SequentialVideoPlayer({
         hlsRef.current = null;
       }
     };
-  }, [isHlsMode, projectId, editId, clips.map(c => c.decision_id).join('|'), isPlaying]);
+  }, [hlsManifestUrl]);
 
   // Fallback sequential mode: set src on clip/index change
   useEffect(() => {
@@ -158,6 +219,35 @@ export default function SequentialVideoPlayer({
     } else {
       const acc = getAccumulatedTime(currentClipIndex);
       onTimeUpdate?.(acc + time, currentClipIndex);
+      
+      // Maintain rolling buffer: preload 3 clips ahead
+      const BUFFER_SIZE = 3;
+      const currentClip = clips[currentClipIndex];
+      if (currentClip && time >= currentClip.duration * 0.5) {
+        // When halfway through current clip, ensure next 3 are buffered
+        for (let offset = 1; offset <= BUFFER_SIZE; offset++) {
+          const targetIndex = currentClipIndex + offset;
+          if (targetIndex < clips.length && !preloadCacheRef.current.has(targetIndex)) {
+            const video = document.createElement('video');
+            video.preload = 'auto';
+            video.src = clips[targetIndex].clip_url;
+            video.addEventListener('canplaythrough', () => {
+              console.log(`[BUFFER] Clip ${targetIndex} ready`);
+              preloadCacheRef.current.set(targetIndex, video);
+            }, { once: true });
+            video.load();
+          }
+        }
+        
+        // Clean up old clips (more than 2 behind current)
+        preloadCacheRef.current.forEach((video, index) => {
+          if (index < currentClipIndex - 2) {
+            video.src = '';
+            preloadCacheRef.current.delete(index);
+            console.log(`[BUFFER] Cleaned up clip ${index}`);
+          }
+        });
+      }
     }
   };
 
@@ -172,12 +262,24 @@ export default function SequentialVideoPlayer({
   // Play/Pause
   const togglePlayPause = () => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !bufferReady) {
+      console.log('[PLAY] Buffer not ready yet, please wait...');
+      return;
+    }
+    console.log('[PLAY] Toggle called, isPlaying:', isPlaying, 'readyState:', video.readyState, 'paused:', video.paused);
     if (isPlaying) {
       video.pause();
       setIsPlaying(false);
     } else {
-      video.play().then(() => setIsPlaying(true)).catch(() => {});
+      console.log('[PLAY] Attempting play...');
+      video.play()
+        .then(() => {
+          console.log('[PLAY] Play successful');
+          setIsPlaying(true);
+        })
+        .catch((err) => {
+          console.error('[PLAY] Play failed:', err);
+        });
     }
   };
 
@@ -256,6 +358,28 @@ export default function SequentialVideoPlayer({
 
   return (
     <Paper ref={containerRef} sx={{ bgcolor: 'black', position: 'relative' }}>
+      {/* Loading Overlay */}
+      {!bufferReady && !isHlsMode && (
+        <Box
+          sx={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'rgba(0, 0, 0, 0.8)',
+            zIndex: 10,
+          }}
+        >
+          <LinearProgress sx={{ width: '50%', mb: 2 }} />
+          <Typography color="white">Buffering clips...</Typography>
+        </Box>
+      )}
+      
       {/* Video Element */}
       <video
         ref={videoRef}
@@ -268,6 +392,13 @@ export default function SequentialVideoPlayer({
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onClick={togglePlayPause}
+      />
+      
+      {/* Hidden preload video for next clip */}
+      <video
+        ref={preloadVideoRef}
+        style={{ display: 'none' }}
+        preload="auto"
       />
 
       {/* Controls Overlay */}

@@ -2,7 +2,7 @@
  * Edit Editor Page - Complete text-based editing interface
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Container,
@@ -47,6 +47,8 @@ export default function EditEditorPage() {
   const [finalizeDialogOpen, setFinalizeDialogOpen] = useState(false);
   const [finalizeJobId, setFinalizeJobId] = useState<string | null>(null);
   const [finalizeProgress, setFinalizeProgress] = useState(0);
+  const [unifiedReady, setUnifiedReady] = useState(false);
+  const [edlManifestUrl, setEdlManifestUrl] = useState<string | undefined>(undefined);
 
   // Fetch edit with decisions
   const { data: edit, isLoading, error } = useQuery({
@@ -66,6 +68,48 @@ export default function EditEditorPage() {
     queryFn: () => apiClient.getEditPreview(projectId!, editId!),
     enabled: !!projectId && !!editId && !!edit,
   });
+
+  // Unified EDL build & poll
+  useEffect(() => {
+    console.log('[EDL] Effect triggered: projectId=', projectId, 'editId=', editId);
+    let stop = false;
+    const run = async () => {
+      if (!projectId || !editId) {
+        console.warn('[EDL] Missing projectId or editId, skipping');
+        return;
+      }
+      try {
+        console.log('[EDL] Initiating build for edit:', editId);
+        const buildResp = await apiClient.buildEdlStream(projectId, editId);
+        console.log('[EDL] Build response:', buildResp);
+      } catch (e) {
+        console.error('[EDL] Build initiation failed:', e);
+      }
+      const tick = async () => {
+        if (stop) return;
+        try {
+          const st = await apiClient.getEdlStatus(projectId!, editId!);
+          console.log('[EDL] Status poll result:', st);
+          if (st.status === 'ready') {
+            setUnifiedReady(true);
+            const manifestUrl = apiClient.getEdlManifestUrl(projectId!, editId!);
+            setEdlManifestUrl(manifestUrl);
+            console.log('[EDL] ✓ Ready! Switching to unified manifest:', manifestUrl);
+            return;
+          }
+        } catch (e) {
+          console.error('[EDL] Status check failed:', e);
+        }
+        setTimeout(tick, 2000);
+      };
+      tick();
+    };
+    run();
+    return () => { 
+      console.log('[EDL] Effect cleanup');
+      stop = true;
+    };
+  }, [projectId, editId]);
 
   // Save edit mutation
   const saveMutation = useMutation({
@@ -187,17 +231,26 @@ export default function EditEditorPage() {
         {/* Left: Video Player */}
         <Box sx={{ width: '50%', p: 2, overflow: 'auto' }}>
           {previewData ? (
-            <SequentialVideoPlayer
-              clips={previewData.clips}
-              projectId={projectId!}
-              editId={editId!}
-              onTimeUpdate={(time, clipIndex) => {
-                setCurrentClipIndex(clipIndex);
-              }}
-              onClipChange={(clipIndex) => {
-                setCurrentClipIndex(clipIndex);
-              }}
-            />
+            unifiedReady ? (
+              <SequentialVideoPlayer
+                clips={previewData.clips}
+                hlsManifestUrl={edlManifestUrl}
+                onTimeUpdate={(time, clipIndex) => {
+                  setCurrentClipIndex(clipIndex);
+                }}
+                onClipChange={(clipIndex) => {
+                  setCurrentClipIndex(clipIndex);
+                }}
+              />
+            ) : (
+              <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '400px', flexDirection: 'column', gap: 2 }}>
+                <CircularProgress />
+                <Typography variant="body1">Building seamless preview...</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  This may take 10–30 seconds on first load
+                </Typography>
+              </Box>
+            )
           ) : (
             <Alert severity="info">Loading preview...</Alert>
           )}

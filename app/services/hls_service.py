@@ -24,20 +24,22 @@ AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
 AUDIO_BITRATE = "128k"
 
+# Builder version for cache invalidation
+BUILDER_VERSION = "2"
+
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _clip_output_paths(base_dir: Path, decision_id: str) -> Tuple[Path, Path, Path]:
+def _clip_output_paths(base_dir: Path, decision_id: str) -> Tuple[Path, str, Path]:
     """
-    Returns (init_mp4, media_m4s, temp_clip_m3u8) paths for a decision.
+    Returns (init_mp4, segment_filename_pattern, per_clip_m3u8) for a decision.
     """
     init_path = base_dir / f"dec_{decision_id}.init.mp4"
-    media_path = base_dir / f"dec_{decision_id}.m4s"
-    # ffmpeg will write a small per-clip playlist we can ignore
+    seg_pattern = f"dec_{decision_id}-%05d.m4s"
     m3u8_path = base_dir / f"dec_{decision_id}.m3u8"
-    return init_path, media_path, m3u8_path
+    return init_path, seg_pattern, m3u8_path
 
 
 def ensure_cmaf_for_decision(
@@ -56,20 +58,28 @@ def ensure_cmaf_for_decision(
     base_dir = Path("tmp") / "hls" / edit_id / "segments"
     _ensure_dir(base_dir)
 
-    init_path, media_path, m3u8_path = _clip_output_paths(base_dir, decision_id)
+    init_path, seg_pattern, m3u8_path = _clip_output_paths(base_dir, decision_id)
+    version_path = base_dir / "version.txt"
 
-    # If both files already exist and are non-empty, reuse
-    if init_path.exists() and media_path.exists() and init_path.stat().st_size > 0 and media_path.stat().st_size > 0:
-        return str(init_path), str(media_path)
+    # If playlist and init exist and version matches, reuse
+    if (
+        init_path.exists() and m3u8_path.exists() and init_path.stat().st_size > 0 and m3u8_path.stat().st_size > 0
+        and version_path.exists() and version_path.read_text(encoding="utf-8").strip() == BUILDER_VERSION
+    ):
+        return str(init_path), str(m3u8_path)
 
-    # Build CMAF pair using ffmpeg HLS (fMP4 single_file)
-    # We intentionally force keyframe at boundaries and fixed GOP to guarantee seamless transitions.
+    # Build CMAF fMP4 with micro-fragments (no single_file). Force keyframe at start, CFR, fixed GOP.
     cmd = [
         "ffmpeg", "-nostdin", "-y",
+        # Accurate seek: apply -ss after input for frame-accurate cuts
+        "-i", source_video_path,
         "-ss", str(start_time),
         "-t", str(duration),
-        "-i", source_video_path,
         "-analyzeduration", "0", "-probesize", "1024k",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        "-muxpreload", "0",
+        "-muxdelay", "0",
         "-c:v", VIDEO_CODEC,
         "-profile:v", VIDEO_PROFILE,
         "-level:v", VIDEO_LEVEL,
@@ -79,18 +89,24 @@ def ensure_cmaf_for_decision(
         "-keyint_min", str(GOP),
         "-sc_threshold", "0",
         "-x264-params", f"keyint={GOP}:min-keyint={GOP}:scenecut=0:open-gop=0",
+        # Keyframe at clip start; also align to fragment cadence (~0.5s)
+        "-force_key_frames", "expr:gte(t,n_forced*0.5)",
+        "-vsync", "cfr",
+        "-video_track_timescale", "90000",
+        "-map", "0:v:0",
+        "-map", "0:a:0",
         "-c:a", AUDIO_CODEC,
         "-b:a", AUDIO_BITRATE,
         "-ar", str(AUDIO_RATE),
         "-ac", str(AUDIO_CHANNELS),
         "-f", "hls",
-        "-hls_time", str(duration),               # single segment equal to clip duration
+        "-hls_time", "0.5",
         "-hls_playlist_type", "vod",
         "-hls_list_size", "0",
-        "-hls_flags", "single_file+independent_segments",
+        "-hls_flags", "independent_segments",
         "-hls_segment_type", "fmp4",
         "-hls_fmp4_init_filename", init_path.name,
-        "-hls_segment_filename", media_path.name,
+        "-hls_segment_filename", str(base_dir / seg_pattern),
         str(m3u8_path)
     ]
 
@@ -101,12 +117,18 @@ def ensure_cmaf_for_decision(
         )
 
     # Sanity check files exist
-    if not (init_path.exists() and media_path.exists()):
+    if not (init_path.exists() and m3u8_path.exists()):
         raise RuntimeError(
-            f"CMAF outputs missing for decision {decision_id}: {init_path} / {media_path}"
+            f"CMAF outputs missing for decision {decision_id}: {init_path} / {m3u8_path}"
         )
 
-    return str(init_path), str(media_path)
+    # Write builder version for cache validation
+    try:
+        version_path.write_text(BUILDER_VERSION, encoding="utf-8")
+    except Exception:
+        pass
+
+    return str(init_path), str(m3u8_path)
 
 
 def build_playlist_content(
@@ -118,7 +140,8 @@ def build_playlist_content(
     Build an HLS VOD playlist where each item is (decision_id, duration_seconds).
     URIs reference API endpoints that serve the init and media files.
     """
-    target_duration = max(1, math.ceil(max((d for _, d in items), default=1)))
+    # We will compute target duration based on parsed fragment durations
+    all_durations: List[float] = []
 
     lines: List[str] = []
     lines.append("#EXTM3U")
@@ -128,15 +151,39 @@ def build_playlist_content(
     lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
     lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
 
-    for decision_id, duration in items:
-        lines.append(
-            f"#EXT-X-MAP:URI=\"/api/projects/{project_id}/edits/{edit_id}/segments/{decision_id}.init\""
-        )
-        lines.append(f"#EXTINF:{duration:.3f},")
-        lines.append(
-            f"/api/projects/{project_id}/edits/{edit_id}/segments/{decision_id}.m4s"
-        )
+    base_dir = Path("tmp") / "hls" / edit_id / "segments"
+    for index, (decision_id, _duration) in enumerate(items):
+        # Read per-clip m3u8 and inline its fragments
+        per_clip_m3u8 = base_dir / f"dec_{decision_id}.m3u8"
+        if index > 0:
+            lines.append("#EXT-X-DISCONTINUITY")
+        lines.append(f"#EXT-X-MAP:URI=\"/api/projects/{project_id}/edits/{edit_id}/segments/dec_{decision_id}.init.mp4\"")
+        if per_clip_m3u8.exists():
+            with open(per_clip_m3u8, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if line.startswith("#EXTINF:"):
+                        # keep duration
+                        lines.append(line)
+                        try:
+                            dur = float(line.split(":",1)[1].split(",")[0])
+                            all_durations.append(dur)
+                        except Exception:
+                            pass
+                    elif line and not line.startswith("#"):
+                        # It's a segment filename; map to our endpoint
+                        seg_name = line
+                        lines.append(f"/api/projects/{project_id}/edits/{edit_id}/segments/{seg_name}")
+        else:
+            # Fallback: single EXTINF using provided duration
+            dur = max(0.01, _duration)
+            all_durations.append(dur)
+            lines.append(f"#EXTINF:{dur:.3f},")
+            lines.append(f"/api/projects/{project_id}/edits/{edit_id}/segments/dec_{decision_id}-00000.m4s")
 
+    target_duration = max(1, math.ceil(max(all_durations) if all_durations else 1))
+    # Rewrite header target duration after computing
+    lines[2] = "#EXT-X-TARGETDURATION:" + str(target_duration)
     lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
 
