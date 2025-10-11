@@ -3,7 +3,7 @@
  * This component can be easily swapped out with different editor implementations.
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Paper, Typography, Button, LinearProgress, Alert, Chip } from '@mui/material';
 // Icons removed if unused
 
@@ -89,6 +89,19 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
   const segmentationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // Added for segmentation polling
   const processingJobRef = useRef<ProcessingJob | null>(null); // Add ref for current job state
   const segmentationJobRef = useRef<ProcessingJob | null>(null); // Add ref for current job state
+
+  // Memoize clips array to prevent unnecessary re-renders
+  const memoizedClips = useMemo(() => 
+    videoClips.map(c => ({
+      decision_id: c.id,
+      clip_url: c.stream_url,
+      start_time: 0,
+      end_time: c.duration,
+      duration: c.duration,
+      transcript_text: '',
+      order_index: c.order_index,
+    })), [videoClips]
+  );
 
   // Define callback functions BEFORE useEffect hooks to avoid reference errors
   
@@ -586,15 +599,7 @@ export const TranscriptVideoEditor: React.FC<TranscriptVideoEditorProps> = ({
             <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
               {editingMode === 'edit' && videoClips.length > 0 ? (
                 <SequentialVideoPlayer
-                  clips={videoClips.map(c => ({
-                    decision_id: c.id,
-                    clip_url: c.stream_url,
-                    start_time: 0,
-                    end_time: c.duration,
-                    duration: c.duration,
-                    transcript_text: '',
-                    order_index: c.order_index,
-                  }))}
+                  clips={memoizedClips}
                   onTimeUpdate={handleTimeUpdate}
                   onClipChange={handleClipChange}
                 />

@@ -2,7 +2,7 @@
  * Sequential Video Player - Plays multiple clips as if they were one video
  */
 
-import { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import Hls from 'hls.js';
 import { Box, IconButton, Slider, Typography, Paper, LinearProgress } from '@mui/material';
 import {
@@ -23,7 +23,7 @@ interface SequentialVideoPlayerProps {
   hlsManifestUrl?: string; // Optional unified EDL manifest override
 }
 
-export default function SequentialVideoPlayer({
+const SequentialVideoPlayer = React.memo(function SequentialVideoPlayer({
   clips,
   onTimeUpdate,
   onClipChange,
@@ -45,8 +45,12 @@ export default function SequentialVideoPlayer({
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [bufferReady, setBufferReady] = useState(false);
+  const [firstClipReady, setFirstClipReady] = useState(false);
+  const [isSeeking, setIsSeeking] = useState(false);
+  const [isLoadingClip, setIsLoadingClip] = useState(false);
   
   const preloadCacheRef = useRef<Map<number, HTMLVideoElement>>(new Map());
+  const intendedPlayingRef = useRef(false); // Track if user intends video to be playing
 
   const totalDuration = clips.reduce((sum, clip) => sum + clip.duration, 0);
 
@@ -61,11 +65,14 @@ export default function SequentialVideoPlayer({
   // Preload buffer: Load 3 clips ahead before allowing playback
   useEffect(() => {
     if (isHlsMode || clips.length === 0) {
+      console.log('[BUFFER] Skipping buffer (HLS mode or no clips)');
       setBufferReady(true);
+      setFirstClipReady(true);
       return;
     }
     
-    console.log('[BUFFER] Preloading first 3 clips...');
+    console.log(`[BUFFER] Preloading first 3 clips from ${clips.length} total...`);
+    setFirstClipReady(false); // Reset first clip ready state
     const BUFFER_SIZE = 3;
     const clipsToPreload = Math.min(BUFFER_SIZE, clips.length);
     let loadedCount = 0;
@@ -78,9 +85,15 @@ export default function SequentialVideoPlayer({
       video.src = clips[index].clip_url;
       
       const onCanPlay = () => {
-        console.log(`[BUFFER] Clip ${index} ready (${video.readyState})`);
+        console.log(`[BUFFER] Clip ${index} ready (${video.readyState}) - ${clips[index].clip_url}`);
         preloadCacheRef.current.set(index, video);
         loadedCount++;
+        
+        // First clip is ready immediately
+        if (index === 0) {
+          console.log('[BUFFER] ✓ First clip ready for immediate playback');
+          setFirstClipReady(true);
+        }
         
         if (loadedCount >= clipsToPreload) {
           console.log(`[BUFFER] ✓ Buffer ready! ${loadedCount} clips preloaded`);
@@ -88,7 +101,12 @@ export default function SequentialVideoPlayer({
         }
       };
       
+      const onError = (e: any) => {
+        console.error(`[BUFFER] Clip ${index} failed to load:`, e, clips[index].clip_url);
+      };
+      
       video.addEventListener('canplaythrough', onCanPlay, { once: true });
+      video.addEventListener('error', onError, { once: true });
       video.load();
     };
     
@@ -101,7 +119,7 @@ export default function SequentialVideoPlayer({
       preloadCacheRef.current.forEach(v => v.src = '');
       preloadCacheRef.current.clear();
     };
-  }, [clips, isHlsMode]);
+  }, [clips.length, isHlsMode]);
 
   // Initialize HLS once when unified manifest is available
   useEffect(() => {
@@ -167,18 +185,57 @@ export default function SequentialVideoPlayer({
     if (!video || isHlsMode) return;
     const current = clips[currentClipIndex];
     if (!current) return;
+    
+    console.log(`[VIDEO] Loading clip ${currentClipIndex}:`, current.clip_url);
+    
     // Only update if different
     const currentPath = video.src ? new URL(video.src, window.location.origin).pathname : '';
     const nextPath = current.clip_url.startsWith('http') ? new URL(current.clip_url).pathname : current.clip_url;
     if (currentPath !== nextPath) {
+      console.log(`[VIDEO] Setting src: ${current.clip_url}`);
+      const shouldAutoPlay = intendedPlayingRef.current; // Use ref, not video.paused
+      
+      setIsLoadingClip(true); // Show loading indicator
       video.src = current.clip_url;
       video.currentTime = 0;
-      if (isPlaying) {
-        video.play().catch(() => {});
+      video.load(); // This will reset readyState to 0
+      
+      // Wait for frames to be decoded before continuing
+      const onLoadedData = () => {
+        console.log('[VIDEO] Loaded data, readyState:', video.readyState);
+        
+        // Force a frame decode by seeking to 0
+        video.currentTime = 0;
+        
+        // Wait for the seek/decode to complete
+        requestAnimationFrame(() => {
+          setIsLoadingClip(false); // Hide loading indicator
+          
+          // If video was playing, resume playback
+          if (shouldAutoPlay) {
+            console.log('[VIDEO] Auto-playing now');
+            video.play()
+              .then(() => {
+                console.log('[VIDEO] Resume successful');
+                setIsPlaying(true);
+              })
+              .catch((e) => console.error('[VIDEO] Resume play failed:', e));
+          }
+        });
+      };
+      
+      // Check if already has decoded frames
+      if (video.readyState >= 2) {
+        console.log('[VIDEO] Already has data');
+        onLoadedData();
+      } else {
+        console.log('[VIDEO] Waiting for loadeddata event');
+        video.addEventListener('loadeddata', onLoadedData, { once: true });
       }
+      
       onClipChange?.(currentClipIndex);
     }
-  }, [isHlsMode, clips, currentClipIndex, isPlaying]);
+  }, [isHlsMode, clips, currentClipIndex]);
 
   // Handle video end
   const handleVideoEnd = () => {
@@ -188,7 +245,7 @@ export default function SequentialVideoPlayer({
     }
     if (currentClipIndex < clips.length - 1) {
       setCurrentClipIndex(prev => prev + 1);
-      setCurrentTime(0);
+      // Don't reset time - let handleTimeUpdate calculate the global time
     } else {
       setIsPlaying(false);
       setCurrentClipIndex(0);
@@ -200,30 +257,39 @@ export default function SequentialVideoPlayer({
   const handleTimeUpdate = () => {
     const video = videoRef.current;
     if (!video) return;
-    const time = video.currentTime;
-    setCurrentTime(time);
+    const localTime = video.currentTime;
+    
+    // Log every second to track playback
+    if (Math.floor(localTime) !== Math.floor(currentTime)) {
+      console.log(`[TIME] Clip ${currentClipIndex} playing at ${localTime.toFixed(2)}s, readyState: ${video.readyState}, paused: ${video.paused}`);
+    }
 
     if (isHlsMode) {
+      // HLS mode: time is already global
+      setCurrentTime(localTime);
       // Map HLS absolute time into clip index using cumulative durations
       let acc = 0;
       let idx = 0;
       for (let i = 0; i < clips.length; i++) {
-        if (time < acc + clips[i].duration) { idx = i; break; }
+        if (localTime < acc + clips[i].duration) { idx = i; break; }
         acc += clips[i].duration;
       }
       if (idx !== currentClipIndex) {
         setCurrentClipIndex(idx);
         onClipChange?.(idx);
       }
-      onTimeUpdate?.(time, idx);
+      onTimeUpdate?.(localTime, idx);
     } else {
-      const acc = getAccumulatedTime(currentClipIndex);
-      onTimeUpdate?.(acc + time, currentClipIndex);
+      // Sequential mode: convert local clip time to global timeline time
+      const accumulatedTime = getAccumulatedTime(currentClipIndex);
+      const globalTime = accumulatedTime + localTime;
+      setCurrentTime(globalTime);
+      onTimeUpdate?.(globalTime, currentClipIndex);
       
       // Maintain rolling buffer: preload 3 clips ahead
       const BUFFER_SIZE = 3;
       const currentClip = clips[currentClipIndex];
-      if (currentClip && time >= currentClip.duration * 0.5) {
+      if (currentClip && localTime >= currentClip.duration * 0.5) {
         // When halfway through current clip, ensure next 3 are buffered
         for (let offset = 1; offset <= BUFFER_SIZE; offset++) {
           const targetIndex = currentClipIndex + offset;
@@ -242,6 +308,9 @@ export default function SequentialVideoPlayer({
         // Clean up old clips (more than 2 behind current)
         preloadCacheRef.current.forEach((video, index) => {
           if (index < currentClipIndex - 2) {
+            // Remove all event listeners before cleanup to prevent error events
+            video.oncanplaythrough = null;
+            video.onerror = null;
             video.src = '';
             preloadCacheRef.current.delete(index);
             console.log(`[BUFFER] Cleaned up clip ${index}`);
@@ -262,24 +331,54 @@ export default function SequentialVideoPlayer({
   // Play/Pause
   const togglePlayPause = () => {
     const video = videoRef.current;
-    if (!video || !bufferReady) {
-      console.log('[PLAY] Buffer not ready yet, please wait...');
+    if (!video || !firstClipReady) {
+      console.log('[PLAY] First clip not ready yet, please wait...');
       return;
     }
-    console.log('[PLAY] Toggle called, isPlaying:', isPlaying, 'readyState:', video.readyState, 'paused:', video.paused);
+    console.log('[PLAY] Toggle called, isPlaying:', isPlaying, 'readyState:', video.readyState, 'paused:', video.paused, 'src:', video.src);
     if (isPlaying) {
       video.pause();
       setIsPlaying(false);
+      intendedPlayingRef.current = false;
     } else {
-      console.log('[PLAY] Attempting play...');
-      video.play()
-        .then(() => {
-          console.log('[PLAY] Play successful');
-          setIsPlaying(true);
-        })
-        .catch((err) => {
-          console.error('[PLAY] Play failed:', err);
+      console.log('[PLAY] Attempting play... readyState:', video.readyState);
+      intendedPlayingRef.current = true;
+      
+      // Wait for at least the first frame to be decoded
+      const attemptPlay = () => {
+        console.log('[PLAY] Starting playback, readyState:', video.readyState);
+        
+        // Force a frame to be decoded by seeking to current position
+        // This ensures the GPU has decoded at least one frame
+        const currentPos = video.currentTime;
+        video.currentTime = currentPos;
+        
+        // Wait a tiny bit for the seek to complete and frame to decode
+        requestAnimationFrame(() => {
+          video.play()
+            .then(() => {
+              console.log('[PLAY] Play successful');
+              setIsPlaying(true);
+            })
+            .catch((err) => {
+              console.error('[PLAY] Play failed:', err);
+            });
         });
+      };
+      
+      // If video has decoded frames, play immediately
+      // Otherwise wait for loadeddata (at least current frame decoded)
+      if (video.readyState >= 2) {
+        console.log('[PLAY] Video has data, playing immediately');
+        attemptPlay();
+      } else {
+        console.log('[PLAY] Video not ready, waiting for loadeddata event...');
+        const onLoadedData = () => {
+          console.log('[PLAY] Loaded data event fired');
+          attemptPlay();
+        };
+        video.addEventListener('loadeddata', onLoadedData, { once: true });
+      }
     }
   };
 
@@ -287,10 +386,15 @@ export default function SequentialVideoPlayer({
   const handleSeek = (newGlobalTime: number) => {
     const video = videoRef.current;
     if (!video) return;
+    
+    setIsSeeking(true);
+    
     if (isHlsMode) {
       video.currentTime = newGlobalTime;
+      setTimeout(() => setIsSeeking(false), 100);
       return;
     }
+    
     let accumulatedTime = 0;
     let targetClipIndex = 0;
     for (let i = 0; i < clips.length; i++) {
@@ -301,11 +405,18 @@ export default function SequentialVideoPlayer({
       accumulatedTime += clips[i].duration;
     }
     const localTime = newGlobalTime - accumulatedTime;
+    
     if (targetClipIndex !== currentClipIndex) {
       setCurrentClipIndex(targetClipIndex);
-      setTimeout(() => { if (videoRef.current) { videoRef.current.currentTime = localTime; } }, 100);
+      setTimeout(() => { 
+        if (videoRef.current) { 
+          videoRef.current.currentTime = localTime; 
+        }
+        setIsSeeking(false);
+      }, 100);
     } else {
       video.currentTime = localTime;
+      setTimeout(() => setIsSeeking(false), 50);
     }
   };
 
@@ -357,9 +468,15 @@ export default function SequentialVideoPlayer({
   }
 
   return (
-    <Paper ref={containerRef} sx={{ bgcolor: 'black', position: 'relative' }}>
+    <Paper ref={containerRef} sx={{ 
+      bgcolor: 'black', 
+      position: 'relative',
+      minHeight: '400px',
+      aspectRatio: '16/9',
+      overflow: 'hidden'
+    }}>
       {/* Loading Overlay */}
-      {!bufferReady && !isHlsMode && (
+      {(!firstClipReady && !isHlsMode) && (
         <Box
           sx={{
             position: 'absolute',
@@ -376,22 +493,71 @@ export default function SequentialVideoPlayer({
           }}
         >
           <LinearProgress sx={{ width: '50%', mb: 2 }} />
-          <Typography color="white">Buffering clips...</Typography>
+          <Typography color="white">Loading first clip...</Typography>
+        </Box>
+      )}
+      
+      {/* Seeking Overlay */}
+      {isSeeking && (
+        <Box
+          sx={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'rgba(0, 0, 0, 0.3)',
+            zIndex: 5,
+          }}
+        >
+          <Typography color="white" variant="h6">Seeking...</Typography>
+        </Box>
+      )}
+      
+      {/* Loading Clip Overlay */}
+      {isLoadingClip && (
+        <Box
+          sx={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'rgba(0, 0, 0, 0.9)',
+            zIndex: 6,
+          }}
+        >
+          <LinearProgress sx={{ width: '50%' }} />
         </Box>
       )}
       
       {/* Video Element */}
       <video
         ref={videoRef}
+        preload="auto"
         style={{
           width: '100%',
-          height: 'auto',
+          height: '100%',
           display: 'block',
+          objectFit: 'contain',
+          backgroundColor: 'black',
         }}
         onEnded={handleVideoEnd}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onClick={togglePlayPause}
+        onPause={(e) => {
+          console.log('[VIDEO EVENT] pause event fired, readyState:', e.currentTarget.readyState);
+        }}
+        onPlay={(e) => {
+          console.log('[VIDEO EVENT] play event fired, readyState:', e.currentTarget.readyState);
+        }}
       />
       
       {/* Hidden preload video for next clip */}
@@ -467,5 +633,7 @@ export default function SequentialVideoPlayer({
       </Box>
     </Paper>
   );
-}
+});
+
+export default SequentialVideoPlayer;
 

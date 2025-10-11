@@ -219,12 +219,18 @@ def cut_video_segment(input_video_path: str, output_video_path: str, start_time:
     
     try:
         # Use ffmpeg to cut the video segment
+        # Re-encode to ensure each clip starts with a keyframe for smooth playback
         cmd = [
             'ffmpeg',
             '-i', input_video_path,
             '-ss', str(start_time),
             '-t', str(duration),
-            '-c', 'copy',  # Copy streams without re-encoding for speed
+            '-c:v', 'libx264',  # Re-encode video to force keyframe at start
+            '-g', '30',  # Keyframe every 30 frames
+            '-force_key_frames', 'expr:gte(t,0)',  # Force keyframe at start (t=0)
+            '-c:a', 'aac',  # Re-encode audio
+            '-b:a', '128k',  # Audio bitrate
+            '-movflags', '+faststart',  # Put moov atom at beginning for fast playback
             '-avoid_negative_ts', 'make_zero',
             '-y',  # Overwrite output file
             output_video_path
